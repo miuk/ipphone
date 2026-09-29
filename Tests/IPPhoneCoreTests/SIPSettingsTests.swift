@@ -33,6 +33,7 @@ struct SIPSettingsTests {
     func bracketsIPv6Domain() throws {
         let settings = SIPSettings(serverHost: "2001:db8::1")
         #expect(try settings.destinationURI(for: "1002") == "sip:1002@[2001:db8::1]")
+        #expect(settings.registrarURI == "sip:[2001:db8::1]:5060;transport=udp")
     }
 
     @Test

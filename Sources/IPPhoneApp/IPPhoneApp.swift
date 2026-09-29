@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import IPPhoneCore
 import SwiftUI
 
@@ -43,6 +44,7 @@ private struct ContentView: View {
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logStore: AppLogStore
     @State private var selection: AppSection? = .phone
+    private let pollTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationSplitView {
@@ -53,19 +55,21 @@ private struct ContentView: View {
         } detail: {
             switch selection ?? .phone {
             case .phone:
-                PhoneView(endpoint: endpoint, settings: settingsStore.settings)
+                PhoneView(endpoint: endpoint, settingsStore: settingsStore, logs: logStore)
             case .settings:
                 SettingsView(store: settingsStore, logs: logStore)
             case .logs:
                 LogView(store: logStore)
             }
         }
+        .onReceive(pollTimer) { _ in endpoint.poll() }
     }
 }
 
 private struct PhoneView: View {
     @ObservedObject var endpoint: SIPEndpoint
-    let settings: SIPSettings
+    @ObservedObject var settingsStore: SettingsStore
+    @ObservedObject var logs: AppLogStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -73,16 +77,23 @@ private struct PhoneView: View {
             LabeledContent("PJSIP", value: endpoint.pjsipVersion)
             LabeledContent("Endpoint", value: stateDescription)
             LabeledContent("Server", value: serverDescription)
-            LabeledContent("Address of Record", value: settings.addressOfRecord ?? "Not configured")
+            LabeledContent("Address of Record", value: settingsStore.settings.addressOfRecord ?? "Not configured")
+            LabeledContent("Registration", value: registrationDescription)
 
             HStack {
                 Button("Start UDP endpoint") {
-                    try? endpoint.startUDP(port: UInt16(exactly: settings.localSIPPort) ?? 0)
+                    startEndpoint()
                 }
-                .disabled(isRunning || settings.transport != .udp)
+                .disabled(isRunning || settingsStore.settings.transport != .udp)
                 Button("Stop") { endpoint.stop() }.disabled(!isRunning)
             }
-            Text("REGISTER will be implemented in milestone 3.").foregroundStyle(.secondary)
+            HStack {
+                Button("Register") { register() }
+                    .disabled(!canRegister)
+                    .keyboardShortcut("r", modifiers: .command)
+                Button("Unregister") { unregister() }
+                    .disabled(!canUnregister)
+            }
             Spacer()
         }
         .padding(28)
@@ -102,8 +113,57 @@ private struct PhoneView: View {
     }
 
     private var serverDescription: String {
+        let settings = settingsStore.settings
         guard !settings.serverHost.isEmpty else { return "Not configured" }
         return "\(settings.transport.rawValue) \(settings.serverHost):\(settings.serverPort)"
+    }
+
+    private var registrationDescription: String {
+        switch endpoint.registrationState {
+        case .unregistered: "Unregistered"
+        case .registering: "Registering…"
+        case let .registered(expiration): "Registered (expires in \(expiration)s)"
+        case .unregistering: "Unregistering…"
+        case let .failed(code, message): code == 0 ? "Failed: \(message)" : "Failed (SIP \(code)): \(message)"
+        }
+    }
+
+    private var canRegister: Bool {
+        settingsStore.settings.transport == .udp
+            && settingsStore.settings.validationIssues().isEmpty
+            && endpoint.registrationState != .registering
+            && endpoint.registrationState != .unregistering
+            && !isRegistered
+    }
+
+    private var canUnregister: Bool {
+        if case .registered = endpoint.registrationState { true } else { false }
+    }
+
+    private var isRegistered: Bool {
+        if case .registered = endpoint.registrationState { true } else { false }
+    }
+
+    private func startEndpoint() {
+        do {
+            try endpoint.startUDP(port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0)
+        } catch {
+            logs.append(.error, category: "SIP", error.localizedDescription)
+        }
+    }
+
+    private func register() {
+        do {
+            if !isRunning { try endpoint.startUDP(port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0) }
+            try endpoint.register(settings: settingsStore.settings, password: settingsStore.password)
+        } catch {
+            logs.append(.error, category: "REGISTER", error.localizedDescription)
+        }
+    }
+
+    private func unregister() {
+        do { try endpoint.unregister() }
+        catch { logs.append(.error, category: "REGISTER", error.localizedDescription) }
     }
 }
 

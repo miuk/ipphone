@@ -86,6 +86,12 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         return "sip:\(normalizedNumber(phoneNumber))@\(formattedHost(effectiveSIPDomain))"
     }
 
+    public var registrarURI: String? {
+        let host = serverHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty, (1...65_535).contains(serverPort) else { return nil }
+        return "sip:\(formattedHost(host)):\(serverPort);transport=\(transport.rawValue.lowercased())"
+    }
+
     public func destinationURI(for input: String) throws -> String {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.lowercased().hasPrefix("sip:") || trimmed.lowercased().hasPrefix("sips:") {
