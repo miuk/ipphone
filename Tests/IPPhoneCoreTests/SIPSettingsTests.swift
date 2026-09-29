@@ -65,6 +65,38 @@ struct SIPSettingsTests {
         customSettings.selectTransport(.tls)
         #expect(customSettings.serverPort == 5090)
     }
+
+    @Test
+    func decodesExistingSettingsWithoutLocalIPAddress() throws {
+        let settings = SIPSettings(serverHost: "sip.example.test", userID: "1001", phoneNumber: "1001")
+        let data = try JSONEncoder().encode(settings)
+        var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "localIPAddress")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(SIPSettings.self, from: legacyData)
+        #expect(decoded == settings)
+        #expect(decoded.localIPAddress == nil)
+    }
+
+    @Test(arguments: ["127.0.0.1", "192.168.1.10", "::1", "2001:db8::1"])
+    func acceptsUnicastIPAddresses(address: String) {
+        let settings = SIPSettings(localIPAddress: address)
+        #expect(!settings.validationIssues().contains { $0.field == .localIPAddress })
+    }
+
+    @Test(arguments: ["", "example.test", "0.0.0.0", "::", "224.0.0.1", "ff02::1", "fe80::1", "fe80::1%en0", "127.0.0.1\r\nVia: invalid"])
+    func rejectsInvalidOrUnusableLocalIPAddresses(address: String) {
+        let settings = SIPSettings(localIPAddress: address)
+        #expect(settings.validationIssues().contains { $0.field == .localIPAddress })
+    }
+
+    @Test
+    func listsLocalInterfaceAddresses() throws {
+        let addresses = try LocalIPAddress.available()
+        #expect(addresses.contains { $0.address == "127.0.0.1" })
+        #expect(addresses.allSatisfy { !$0.interfaceName.isEmpty && LocalIPAddress.isValid($0.address) })
+        #expect(Set(addresses.map(\.id)).count == addresses.count)
+    }
 }
 
 @MainActor
@@ -79,7 +111,8 @@ struct SettingsStoreTests {
         store.settings = SIPSettings(
             serverHost: "sip.example.test",
             userID: "1001",
-            phoneNumber: "1001"
+            phoneNumber: "1001",
+            localIPAddress: "127.0.0.1"
         )
         store.password = "secret-value"
 
@@ -87,6 +120,9 @@ struct SettingsStoreTests {
         let persistedData = try #require(defaults.data(forKey: "sip-settings-v1"))
         #expect(!String(decoding: persistedData, as: UTF8.self).contains("secret-value"))
         #expect(try credentials.loadPassword() == "secret-value")
+        let restored = SettingsStore(defaults: defaults, credentialStore: credentials)
+        #expect(restored.settings == store.settings)
+        #expect(restored.settings.localIPAddress == "127.0.0.1")
     }
 }
 

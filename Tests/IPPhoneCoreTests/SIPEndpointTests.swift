@@ -71,8 +71,8 @@ struct SIPEndpointTests {
         #expect(!logs.exportedText.localizedCaseInsensitiveContains("Authorization:"))
     }
 
-    @Test
-    func enclosesOutgoingFromAndToURIs() throws {
+    @Test(arguments: [nil, "127.0.0.1"] as [String?])
+    func enclosesOutgoingFromAndToURIs(localIPAddress: String?) throws {
         let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         try #require(descriptor >= 0)
         defer { close(descriptor) }
@@ -98,25 +98,35 @@ struct SIPEndpointTests {
                                socklen_t(MemoryLayout<timeval>.size)) == 0)
 
         let endpoint = SIPEndpoint()
-        try endpoint.startUDP(port: 0)
+        try endpoint.startUDP(port: 0, localIPAddress: localIPAddress)
         defer { endpoint.stop() }
         let settings = SIPSettings(
             serverHost: "127.0.0.1",
             serverPort: Int(address.sin_port.bigEndian),
             userID: "1001",
-            phoneNumber: "1001"
+            phoneNumber: "1001",
+            localIPAddress: localIPAddress
         )
         try endpoint.register(settings: settings, password: "test-password")
         let registration = try receiveMessage(descriptor: descriptor)
         #expect(registration.hasPrefix("REGISTER "))
         #expect(registration.contains("\r\nFrom: <sip:1001@127.0.0.1>;tag="))
         #expect(registration.contains("\r\nTo: <sip:1001@127.0.0.1>\r\n"))
+        if let localIPAddress, case let .running(port) = endpoint.state {
+            #expect(registration.contains("\r\nVia: SIP/2.0/UDP \(localIPAddress):\(port);"))
+            #expect(registration.contains("\r\nContact: <sip:1001@\(localIPAddress):\(port);transport=udp>\r\n"))
+        }
 
         try endpoint.makeCall(destination: "1002", settings: settings, password: "test-password")
         let invite = try receiveMessage(descriptor: descriptor)
         #expect(invite.hasPrefix("INVITE sip:1002@127.0.0.1:\(settings.serverPort);transport=udp SIP/2.0\r\n"))
         #expect(invite.contains("\r\nFrom: <sip:1001@127.0.0.1>;tag="))
         #expect(invite.contains("\r\nTo: <sip:1002@127.0.0.1>\r\n"))
+        if let localIPAddress, case let .running(port) = endpoint.state {
+            #expect(invite.contains("\r\nVia: SIP/2.0/UDP \(localIPAddress):\(port);"))
+            #expect(invite.contains("\r\nContact: <sip:1001@\(localIPAddress):\(port);transport=udp>\r\n"))
+            #expect(invite.contains("\r\nc=IN IP4 \(localIPAddress)\r\n"))
+        }
 
         guard case let .running(port) = endpoint.state else {
             Issue.record("Endpoint did not start")
@@ -142,6 +152,173 @@ struct SIPEndpointTests {
         }
         try #require(received > 0)
         return String(decoding: buffer.prefix(received), as: UTF8.self)
+    }
+
+    @Test(arguments: [SIPTransport.udp, .tcp], ["127.0.0.1", "::1"])
+    func advertisesSelectedAddressInRegistrationAndInvite(transport: SIPTransport, localIP: String) throws {
+        let family = localIP.contains(":") ? AF_INET6 : AF_INET
+        let receiver = socket(family, transport == .udp ? SOCK_DGRAM : SOCK_STREAM, 0)
+        try #require(receiver >= 0)
+        defer { close(receiver) }
+        let serverPort = try bindLoopbackSocket(receiver, family: family)
+        if transport == .tcp {
+            try #require(listen(receiver, 1) == 0)
+            try #require(fcntl(receiver, F_SETFL, O_NONBLOCK) == 0)
+        }
+
+        let endpoint = SIPEndpoint()
+        try endpoint.start(transport: transport, localIPAddress: localIP)
+        defer { endpoint.stop() }
+        let settings = SIPSettings(
+            serverHost: localIP,
+            serverPort: serverPort,
+            transport: transport,
+            userID: "1001",
+            phoneNumber: "1001",
+            sipDomain: "example.test",
+            localIPAddress: localIP
+        )
+        try endpoint.register(settings: settings, password: "test-password")
+
+        var peer = receiver
+        if transport == .tcp {
+            for _ in 0..<100 {
+                endpoint.poll()
+                peer = accept(receiver, nil, nil)
+                if peer >= 0 { break }
+                usleep(1_000)
+            }
+            try #require(peer >= 0)
+            try #require(fcntl(peer, F_SETFL, 0) == 0)
+        }
+        defer { if transport == .tcp { close(peer) } }
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        try #require(setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                               socklen_t(MemoryLayout<timeval>.size)) == 0)
+        for _ in 0..<5 { endpoint.poll() }
+        let registration = try receiveMessage(descriptor: peer)
+
+        guard case let .running(port) = endpoint.state else {
+            Issue.record("Endpoint did not start")
+            return
+        }
+        let headerIP = family == AF_INET6 ? "[\(localIP)]" : localIP
+        let contact = "\r\nContact: <sip:1001@\(headerIP):\(port);transport=\(transport.rawValue.lowercased())>\r\n"
+        #expect(registration.hasPrefix("REGISTER "))
+        #expect(registration.contains("\r\nVia: SIP/2.0/\(transport.rawValue) \(headerIP):"))
+        #expect(registration.contains(contact))
+        #expect(registration.contains("\r\nFrom: <sip:1001@example.test>;tag="))
+
+        try endpoint.makeCall(destination: "1002", settings: settings, password: "test-password")
+        for _ in 0..<5 { endpoint.poll() }
+        let invite = try receiveMessage(descriptor: peer)
+        #expect(invite.hasPrefix("INVITE "))
+        #expect(invite.contains("\r\nVia: SIP/2.0/\(transport.rawValue) \(headerIP):"))
+        #expect(invite.contains(contact))
+        #expect(invite.contains("\r\nc=IN \(family == AF_INET6 ? "IP6" : "IP4") \(localIP)\r\n"))
+        #expect(invite.contains("\r\nFrom: <sip:1001@example.test>;tag="))
+    }
+
+    private func bindLoopbackSocket(_ descriptor: Int32, family: Int32) throws -> Int {
+        if family == AF_INET6 {
+            var address = sockaddr_in6()
+            address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            address.sin6_family = sa_family_t(AF_INET6)
+            try #require(inet_pton(AF_INET6, "::1", &address.sin6_addr) == 1)
+            var length = socklen_t(address.sin6_len)
+            let bound = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(descriptor, $0, length) }
+            }
+            try #require(bound == 0)
+            let named = withUnsafeMutablePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
+            }
+            try #require(named == 0)
+            return Int(address.sin6_port.bigEndian)
+        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(address.sin_len)
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(descriptor, $0, length) }
+        }
+        try #require(bound == 0)
+        let named = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
+        }
+        try #require(named == 0)
+        return Int(address.sin_port.bigEndian)
+    }
+
+    @Test(arguments: ["127.0.0.1", "::1"])
+    func startsTLSWithSelectedAddress(localIP: String) throws {
+        let endpoint = SIPEndpoint()
+        try endpoint.start(transport: .tls, localIPAddress: localIP)
+        defer { endpoint.stop() }
+        #expect(endpoint.activeLocalIPAddress == localIP)
+        #expect(endpoint.activeTransport == .tls)
+        guard case let .running(port) = endpoint.state else {
+            Issue.record("TLS endpoint did not start")
+            return
+        }
+        #expect(port > 0)
+    }
+
+    @Test
+    func requiresRestartAfterChangingLocalAddress() throws {
+        let endpoint = SIPEndpoint()
+        try endpoint.startUDP(localIPAddress: "127.0.0.1")
+        defer { endpoint.stop() }
+        let settings = SIPSettings(serverHost: "127.0.0.1", userID: "1001", phoneNumber: "1001")
+        #expect(throws: SIPEndpointError.self) { try endpoint.register(settings: settings, password: "") }
+        #expect(throws: SIPEndpointError.self) { try endpoint.makeCall(destination: "1002", settings: settings, password: "") }
+        #expect(throws: SIPEndpointError.self) { try endpoint.startUDP() }
+        endpoint.stop()
+        #expect(endpoint.activeLocalIPAddress == nil)
+        try endpoint.startUDP()
+        try endpoint.register(settings: settings, password: "")
+    }
+
+    @Test
+    func rejectsUnavailableAddressWithoutStartingEndpoint() throws {
+        let endpoint = SIPEndpoint()
+        let unavailable = "192.0.2.123"
+        try #require(!LocalIPAddress.available().contains { $0.address == unavailable })
+        #expect(throws: SIPEndpointError.self) { try endpoint.startUDP(localIPAddress: unavailable) }
+        #expect(endpoint.state == .stopped)
+        try endpoint.startUDP(localIPAddress: "127.0.0.1")
+        endpoint.stop()
+    }
+
+    @Test
+    func usesSelectedAddressInIncomingCallContact() throws {
+        let receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(receiver >= 0)
+        defer { close(receiver) }
+        _ = try bindLoopbackSocket(receiver, family: AF_INET)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        try #require(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                               socklen_t(MemoryLayout<timeval>.size)) == 0)
+        let endpoint = SIPEndpoint()
+        try endpoint.startUDP(localIPAddress: "127.0.0.1")
+        defer { endpoint.stop() }
+        guard case let .running(port) = endpoint.state else {
+            Issue.record("Endpoint did not start")
+            return
+        }
+        try sendInvite(to: port, senderDescriptor: receiver, toDomain: "example.test")
+        for _ in 0..<5 { endpoint.poll() }
+        let ringing = try receiveMessage(descriptor: receiver)
+        #expect(ringing.hasPrefix("SIP/2.0 180 "))
+        let contact = "\r\nContact: <sip:1001@127.0.0.1:\(port);transport=udp>\r\n"
+        #expect(ringing.contains(contact))
+        try endpoint.answerCall()
+        let answer = try receiveMessage(descriptor: receiver)
+        #expect(answer.hasPrefix("SIP/2.0 200 "))
+        #expect(answer.contains(contact))
+        #expect(answer.contains("\r\nTo: <sip:1001@example.test>;tag="))
     }
 
     @Test
@@ -301,7 +478,8 @@ struct SIPEndpointTests {
         to port: UInt16,
         supportsTelephoneEvent: Bool = false,
         senderDescriptor: Int32? = nil,
-        bareURIs: Bool = false
+        bareURIs: Bool = false,
+        toDomain: String = "127.0.0.1"
     ) throws {
         let descriptor = senderDescriptor ?? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         try #require(descriptor >= 0)
@@ -327,7 +505,7 @@ struct SIPEndpointTests {
         Via: SIP/2.0/UDP 127.0.0.1:5099\(senderDescriptor == nil ? "" : ";rport");branch=z9hG4bK-test-invite\r
         Max-Forwards: 70\r
         From: \(bareURIs ? "sip:2002@127.0.0.1" : "<sip:2002@127.0.0.1>");tag=test-from\r
-        To: \(bareURIs ? "sip:1001@127.0.0.1" : "<sip:1001@127.0.0.1>")\r
+        To: \(bareURIs ? "sip:1001@\(toDomain)" : "<sip:1001@\(toDomain)>")\r
         Call-ID: test-call@127.0.0.1\r
         CSeq: 1 INVITE\r
         Contact: <sip:2002@127.0.0.1:5099>\r

@@ -32,6 +32,7 @@ scripts/package_app.sh
 
 - PJSIP EndpointとUDPトランスポートの初期化・停止
 - SIP、アカウント、メディア、TLS設定と入力検証
+- SIPヘッダ用ローカルIPの自動選択／インターフェース別選択（IPv4・IPv6）
 - UserDefaultsおよびKeychainへの設定保存
 - OSLogとアプリ内ログ表示
 - UDPによるREGISTER、Digest認証、登録解除、自動更新
@@ -47,3 +48,10 @@ scripts/package_app.sh
 - Apple Silicon向けローカル配布用`.app`、ZIP、dSYM生成
 
 計画した全マイルストーンを完了しています。
+
+複数のローカルIPがある場合は、Settings → SIP Server →
+「Local IP for SIP headers」で使用するIPを選び、Saveで保存してください。
+Via・ContactヘッダとSDPに選択したIPを使用します。Automaticでは従来どおり
+自動選択します。起動中に変更した場合は、Phone画面でStopしてから再起動してください。
+IP一覧は「Refresh local IP addresses」で更新できます。利用できなくなった選択済みIPは
+unavailableと表示し、起動時にエラーにします。IPv6リンクローカルアドレスは一覧から除外します。

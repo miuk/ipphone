@@ -34,6 +34,7 @@ struct IPPJSIPEndpoint {
     pjsip_transport *transport;
     pjsip_tpfactory *transport_factory;
     IPPJSIPTransport transport_kind;
+    bool has_selected_local_address;
     pjsip_regc *registration_client;
     pjsip_inv_session *invite_session;
     pjsip_module app_module;
@@ -178,6 +179,31 @@ static const char *endpoint_transport_name(const IPPJSIPEndpoint *endpoint) {
     default:
         return "udp";
     }
+}
+
+static pjsip_tpselector endpoint_transport_selector(const IPPJSIPEndpoint *endpoint) {
+    pjsip_tpselector selector;
+    pj_bzero(&selector, sizeof(selector));
+    if (endpoint->transport != NULL) {
+        selector.type = PJSIP_TPSELECTOR_TRANSPORT;
+        selector.u.transport = endpoint->transport;
+    } else {
+        selector.type = PJSIP_TPSELECTOR_LISTENER;
+        selector.u.listener = endpoint->transport_factory;
+    }
+    return selector;
+}
+
+static bool build_local_contact(const IPPJSIPEndpoint *endpoint, const pj_str_t *user,
+                                char *buffer, size_t capacity) {
+    const pjsip_host_port *local = endpoint_local_name(endpoint);
+    if (local == NULL) { return false; }
+    const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
+    int length = snprintf(buffer, capacity,
+        ipv6 ? "<sip:%.*s@[%.*s]:%d;transport=%s>" : "<sip:%.*s@%.*s:%d;transport=%s>",
+        (int)user->slen, user->ptr, (int)local->host.slen, local->host.ptr,
+        local->port, endpoint_transport_name(endpoint));
+    return length > 0 && (size_t)length < capacity;
 }
 
 static pj_status_t dtmf_inject_put_frame(pjmedia_port *port, pjmedia_frame *frame) {
@@ -556,16 +582,33 @@ static pj_bool_t incoming_request(pjsip_rx_data *rdata) {
         return PJ_TRUE;
     }
 
+    char contact_buffer[PJSIP_MAX_URL_SIZE];
+    pj_str_t contact;
+    pj_str_t *local_contact = NULL;
+    if (endpoint->has_selected_local_address) {
+        pjsip_uri *to_uri = pjsip_uri_get_uri(rdata->msg_info.to->uri);
+        if ((PJSIP_URI_SCHEME_IS_SIP(to_uri) || PJSIP_URI_SCHEME_IS_SIPS(to_uri)) &&
+            build_local_contact(endpoint, &((pjsip_sip_uri *)to_uri)->user,
+                                contact_buffer, sizeof(contact_buffer))) {
+            contact = pj_str(contact_buffer);
+            local_contact = &contact;
+        }
+    }
     pjsip_dialog *dialog = NULL;
     pj_status_t status = pjsip_dlg_create_uas_and_inc_lock(
         pjsip_ua_instance(),
         rdata,
-        NULL,
+        local_contact,
         &dialog
     );
     if (status != PJ_SUCCESS) {
         pjsip_endpt_respond_stateless(endpoint->sip_endpoint, rdata, 500, NULL, NULL, NULL);
         return PJ_TRUE;
+    }
+
+    if (endpoint->has_selected_local_address) {
+        pjsip_tpselector selector = endpoint_transport_selector(endpoint);
+        pjsip_dlg_set_transport(dialog, &selector);
     }
 
     pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, endpoint->rtp_port);
@@ -681,6 +724,7 @@ bool ip_pjsip_endpoint_start(
     int audio_input_device,
     int audio_output_device,
     bool allow_self_signed_certificate,
+    const char *local_ip_address,
     char *error_buffer,
     int error_buffer_length
 ) {
@@ -720,6 +764,7 @@ bool ip_pjsip_endpoint_start(
     endpoint->audio_input_device = audio_input_device;
     endpoint->audio_output_device = audio_output_device;
     endpoint->transport_kind = transport_kind;
+    endpoint->has_selected_local_address = local_ip_address != NULL && local_ip_address[0] != '\0';
 
     status = pjmedia_endpt_create2(
         &endpoint->caching_pool.factory,
@@ -846,38 +891,44 @@ bool ip_pjsip_endpoint_start(
         return false;
     }
 
-    pj_sockaddr_in address;
-    pj_sockaddr_in_init(&address, NULL, port);
+    pj_sockaddr address;
+    pj_str_t local_ip = pj_str((char *)(local_ip_address == NULL ? "" : local_ip_address));
+    int address_family = strchr(local_ip.ptr, ':') == NULL ? pj_AF_INET() : pj_AF_INET6();
+    status = pj_sockaddr_init(address_family, &address,
+                              local_ip.slen == 0 ? NULL : &local_ip, port);
+    if (status != PJ_SUCCESS) {
+        copy_status_error(error_buffer, error_buffer_length, "Invalid local SIP address", status);
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
+    // Derive the published address from the bound socket so ephemeral ports
+    // are included. Supplying an explicit UDP published port of 0 preserves
+    // that zero rather than substituting the actual bound port.
     const char *transport_operation = NULL;
     switch (transport_kind) {
     case IP_PJSIP_TRANSPORT_UDP:
-        transport_operation = "pjsip_udp_transport_start";
-        status = pjsip_udp_transport_start(
-            endpoint->sip_endpoint,
-            &address,
-            NULL,
-            1,
-            &endpoint->transport
-        );
+        transport_operation = "pjsip_udp_transport_start2";
+        pjsip_udp_transport_cfg udp_config;
+        pjsip_udp_transport_cfg_default(&udp_config, address_family);
+        udp_config.bind_addr = address;
+        status = pjsip_udp_transport_start2(endpoint->sip_endpoint, &udp_config, &endpoint->transport);
         break;
     case IP_PJSIP_TRANSPORT_TCP:
-        transport_operation = "pjsip_tcp_transport_start";
-        status = pjsip_tcp_transport_start(
-            endpoint->sip_endpoint,
-            &address,
-            1,
-            &endpoint->transport_factory
-        );
+        transport_operation = "pjsip_tcp_transport_start3";
+        pjsip_tcp_transport_cfg tcp_config;
+        pjsip_tcp_transport_cfg_default(&tcp_config, address_family);
+        tcp_config.bind_addr = address;
+        status = pjsip_tcp_transport_start3(endpoint->sip_endpoint, &tcp_config, &endpoint->transport_factory);
         break;
     case IP_PJSIP_TRANSPORT_TLS: {
-        transport_operation = "pjsip_tls_transport_start";
+        transport_operation = "pjsip_tls_transport_start2";
         pjsip_tls_setting tls_settings;
         pjsip_tls_setting_default(&tls_settings);
         tls_settings.proto = PJ_SSL_SOCK_PROTO_TLS1_2 | PJ_SSL_SOCK_PROTO_TLS1_3;
         tls_settings.verify_server = allow_self_signed_certificate ? PJ_FALSE : PJ_TRUE;
         tls_settings.verify_client = PJ_FALSE;
         tls_settings.require_client_cert = PJ_FALSE;
-        status = pjsip_tls_transport_start(
+        status = pjsip_tls_transport_start2(
             endpoint->sip_endpoint,
             &tls_settings,
             &address,
@@ -927,6 +978,7 @@ bool ip_pjsip_endpoint_start_udp(
         audio_input_device,
         audio_output_device,
         true,
+        NULL,
         error_buffer,
         error_buffer_length
     );
@@ -984,25 +1036,13 @@ bool ip_pjsip_endpoint_register(
     }
 
     char contact_buffer[PJSIP_MAX_URL_SIZE];
-    const pjsip_host_port *local = endpoint_local_name(endpoint);
-    if (local == NULL) {
-        copy_error(error_buffer, error_buffer_length, "SIP transport has no local address");
+    pj_str_t contact_user = pj_str((char *)user_id);
+    if (!build_local_contact(endpoint, &contact_user, contact_buffer, sizeof(contact_buffer))) {
+        copy_error(error_buffer, error_buffer_length, "Unable to create local SIP Contact");
         pjsip_regc_destroy(endpoint->registration_client);
         endpoint->registration_client = NULL;
         return false;
     }
-    const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
-    const char *transport_name = endpoint_transport_name(endpoint);
-    snprintf(
-        contact_buffer,
-        sizeof(contact_buffer),
-        ipv6 ? "<sip:%s@[%.*s]:%d;transport=%s>" : "<sip:%s@%.*s:%d;transport=%s>",
-        user_id,
-        (int)local->host.slen,
-        local->host.ptr,
-        local->port,
-        transport_name
-    );
 
     pj_str_t registrar = pj_str((char *)registrar_uri);
     pj_str_t aor = pj_str((char *)address_of_record);
@@ -1021,6 +1061,11 @@ bool ip_pjsip_endpoint_register(
         pjsip_regc_destroy(endpoint->registration_client);
         endpoint->registration_client = NULL;
         return false;
+    }
+
+    if (endpoint->has_selected_local_address) {
+        pjsip_tpselector selector = endpoint_transport_selector(endpoint);
+        pjsip_regc_set_transport(endpoint->registration_client, &selector);
     }
 
     pjsip_cred_info credential;
@@ -1131,24 +1176,12 @@ bool ip_pjsip_endpoint_make_call(
         return false;
     }
 
-    const pjsip_host_port *local = endpoint_local_name(endpoint);
-    if (local == NULL) {
-        copy_error(error_buffer, error_buffer_length, "SIP transport has no local address");
+    char contact_buffer[PJSIP_MAX_URL_SIZE];
+    pj_str_t contact_user = pj_str((char *)user_id);
+    if (!build_local_contact(endpoint, &contact_user, contact_buffer, sizeof(contact_buffer))) {
+        copy_error(error_buffer, error_buffer_length, "Unable to create local SIP Contact");
         return false;
     }
-    const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
-    const char *transport_name = endpoint_transport_name(endpoint);
-    char contact_buffer[PJSIP_MAX_URL_SIZE];
-    snprintf(
-        contact_buffer,
-        sizeof(contact_buffer),
-        ipv6 ? "<sip:%s@[%.*s]:%d;transport=%s>" : "<sip:%s@%.*s:%d;transport=%s>",
-        user_id,
-        (int)local->host.slen,
-        local->host.ptr,
-        local->port,
-        transport_name
-    );
     pj_str_t local_uri_string = pj_str((char *)local_uri);
     pj_str_t contact = pj_str(contact_buffer);
     pj_str_t remote_uri = pj_str((char *)destination_uri);
@@ -1187,6 +1220,13 @@ bool ip_pjsip_endpoint_make_call(
         copy_status_error(error_buffer, error_buffer_length, "pjsip_inv_create_uac", status);
         pjsip_dlg_terminate(dialog);
         return false;
+    }
+
+    // The INVITE usage must retain the dialog before a setter acquires and
+    // releases its lock; a dialog with no usages is destroyed on unlock.
+    if (endpoint->has_selected_local_address) {
+        pjsip_tpselector selector = endpoint_transport_selector(endpoint);
+        pjsip_dlg_set_transport(dialog, &selector);
     }
 
     pjsip_tx_data *request = NULL;

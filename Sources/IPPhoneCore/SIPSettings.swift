@@ -35,6 +35,7 @@ public struct SIPSettings: Codable, Equatable, Sendable {
     public var tlsURIScheme: TLSURIScheme
     public var allowSelfSignedCertificate: Bool
     public var localSIPPort: Int
+    public var localIPAddress: String?
     public var registrationExpiration: Int
     public var rtpPortStart: Int
     public var rtpPortEnd: Int
@@ -54,6 +55,7 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         tlsURIScheme: TLSURIScheme = .sip,
         allowSelfSignedCertificate: Bool = true,
         localSIPPort: Int = 0,
+        localIPAddress: String? = nil,
         registrationExpiration: Int = 300,
         rtpPortStart: Int = 4_000,
         rtpPortEnd: Int = 4_999,
@@ -72,6 +74,7 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         self.tlsURIScheme = tlsURIScheme
         self.allowSelfSignedCertificate = allowSelfSignedCertificate
         self.localSIPPort = localSIPPort
+        self.localIPAddress = localIPAddress
         self.registrationExpiration = registrationExpiration
         self.rtpPortStart = rtpPortStart
         self.rtpPortEnd = rtpPortEnd
@@ -134,6 +137,9 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         }
         if !(0...65_535).contains(localSIPPort) {
             issues.append(.init(field: .localSIPPort, message: "ローカルSIPポートは0～65535で指定してください。"))
+        }
+        if let localIPAddress, !LocalIPAddress.isValid(localIPAddress) {
+            issues.append(.init(field: .localIPAddress, message: "SIPヘッダ用のローカルIPアドレスが正しくありません。"))
         }
         if userID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append(.init(field: .userID, message: "user IDを入力してください。"))
@@ -199,6 +205,7 @@ public enum SIPSettingsField: String, Sendable {
     case serverHost
     case serverPort
     case localSIPPort
+    case localIPAddress
     case userID
     case phoneNumber
     case sipDomain

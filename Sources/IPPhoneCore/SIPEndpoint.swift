@@ -93,6 +93,7 @@ public final class SIPEndpoint: ObservableObject {
     @Published public private(set) var rtpStatistics = RTPStatistics()
     @Published public private(set) var telephoneEventAvailable = false
     @Published public private(set) var activeTransport: SIPTransport?
+    @Published public private(set) var activeLocalIPAddress: String?
 
     public let pjsipVersion: String
 
@@ -109,7 +110,8 @@ public final class SIPEndpoint: ObservableObject {
         port: UInt16 = 0,
         rtpPort: UInt16 = 4_000,
         audioInputDevice: Int32 = -1,
-        audioOutputDevice: Int32 = -1
+        audioOutputDevice: Int32 = -1,
+        localIPAddress: String? = nil
     ) throws {
         try start(
             transport: .udp,
@@ -117,7 +119,8 @@ public final class SIPEndpoint: ObservableObject {
             rtpPort: rtpPort,
             audioInputDevice: audioInputDevice,
             audioOutputDevice: audioOutputDevice,
-            allowSelfSignedCertificate: true
+            allowSelfSignedCertificate: true,
+            localIPAddress: localIPAddress
         )
     }
 
@@ -127,10 +130,22 @@ public final class SIPEndpoint: ObservableObject {
         rtpPort: UInt16 = 4_000,
         audioInputDevice: Int32 = -1,
         audioOutputDevice: Int32 = -1,
-        allowSelfSignedCertificate: Bool = true
+        allowSelfSignedCertificate: Bool = true,
+        localIPAddress: String? = nil
     ) throws {
         guard handle == nil else {
+            guard activeTransport == transport, activeLocalIPAddress == localIPAddress else {
+                throw SIPEndpointError.startupFailed("Stop and restart the endpoint after changing SIP transport or local IP address.")
+            }
             return
+        }
+        if let localIPAddress {
+            guard LocalIPAddress.isValid(localIPAddress) else {
+                throw SIPEndpointError.startupFailed("The local SIP IP address is invalid.")
+            }
+            guard try LocalIPAddress.available().contains(where: { $0.address == localIPAddress }) else {
+                throw SIPEndpointError.startupFailed("The selected local SIP IP address is unavailable. Select an available address in Settings.")
+            }
         }
         guard let newHandle = ip_pjsip_endpoint_create() else {
             state = .failed(message: SIPEndpointError.allocationFailed.localizedDescription)
@@ -144,17 +159,21 @@ public final class SIPEndpoint: ObservableObject {
         case .tcp: IP_PJSIP_TRANSPORT_TCP
         case .tls: IP_PJSIP_TRANSPORT_TLS
         }
-        let started = ip_pjsip_endpoint_start(
-            newHandle,
-            bridgeTransport,
-            port,
-            rtpPort,
-            audioInputDevice,
-            audioOutputDevice,
-            allowSelfSignedCertificate,
-            &errorBuffer,
-            Int32(errorBuffer.count)
-        )
+        let startBridge: (UnsafePointer<CChar>?) -> Bool = { address in
+            ip_pjsip_endpoint_start(
+                newHandle,
+                bridgeTransport,
+                port,
+                rtpPort,
+                audioInputDevice,
+                audioOutputDevice,
+                allowSelfSignedCertificate,
+                address,
+                &errorBuffer,
+                Int32(errorBuffer.count)
+            )
+        }
+        let started = localIPAddress.map { $0.withCString(startBridge) } ?? startBridge(nil)
 
         guard started else {
             let messageBytes = errorBuffer.prefix { $0 != 0 }.map(UInt8.init(bitPattern:))
@@ -169,6 +188,7 @@ public final class SIPEndpoint: ObservableObject {
         let boundPort = ip_pjsip_endpoint_bound_port(newHandle)
         state = .running(localPort: boundPort)
         activeTransport = transport
+        activeLocalIPAddress = localIPAddress
         let certificatePolicy = transport == .tls
             ? allowSelfSignedCertificate
                 ? ", server certificate verification disabled"
@@ -177,7 +197,7 @@ public final class SIPEndpoint: ObservableObject {
         logStore?.append(
             .info,
             category: "SIP",
-            "\(transport.rawValue) endpoint started on local port \(boundPort)\(certificatePolicy)"
+            "\(transport.rawValue) endpoint started on local port \(boundPort), local IP \(localIPAddress ?? "automatic")\(certificatePolicy)"
         )
     }
 
@@ -187,6 +207,9 @@ public final class SIPEndpoint: ObservableObject {
         }
         guard activeTransport == settings.transport else {
             throw SIPEndpointError.registrationFailed("Stop and restart the endpoint after changing SIP transport.")
+        }
+        guard activeLocalIPAddress == settings.localIPAddress else {
+            throw SIPEndpointError.registrationFailed("Stop and restart the endpoint after changing the local SIP IP address.")
         }
         guard settings.validationIssues().isEmpty else {
             throw SIPEndpointError.registrationFailed("SIP settings are invalid.")
@@ -251,6 +274,9 @@ public final class SIPEndpoint: ObservableObject {
         }
         guard activeTransport == settings.transport else {
             throw SIPEndpointError.callFailed("Stop and restart the endpoint after changing SIP transport.")
+        }
+        guard activeLocalIPAddress == settings.localIPAddress else {
+            throw SIPEndpointError.callFailed("Stop and restart the endpoint after changing the local SIP IP address.")
         }
         guard settings.validationIssues().isEmpty,
               let localURI = settings.addressOfRecord,
@@ -506,6 +532,7 @@ public final class SIPEndpoint: ObservableObject {
         rtpStatistics = RTPStatistics()
         telephoneEventAvailable = false
         activeTransport = nil
+        activeLocalIPAddress = nil
         logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 

@@ -65,6 +65,7 @@ bool ip_pjsip_endpoint_start_udp(
 
 /// Initializes PJSIP and starts the selected SIP transport. TLS uses TLS
 /// 1.2/1.3 and verifies the server certificate unless explicitly disabled.
+/// local_ip_address is the bind and published address, or NULL for automatic.
 bool ip_pjsip_endpoint_start(
     IPPJSIPEndpoint *endpoint,
     IPPJSIPTransport transport,
@@ -73,6 +74,7 @@ bool ip_pjsip_endpoint_start(
     int audio_input_device,
     int audio_output_device,
     bool allow_self_signed_certificate,
+    const char *local_ip_address,
     char *error_buffer,
     int error_buffer_length
 );

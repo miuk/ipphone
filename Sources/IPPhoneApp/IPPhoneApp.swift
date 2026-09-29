@@ -91,6 +91,11 @@ private struct PhoneView: View {
             Text("IP Phone Test Client").font(.largeTitle)
             LabeledContent("PJSIP", value: endpoint.pjsipVersion)
             LabeledContent("Endpoint", value: stateDescription)
+            LabeledContent("Local SIP IP", value: endpoint.activeLocalIPAddress ?? "Automatic")
+            if isRunning && !transportMatches {
+                Label("Stop and restart the endpoint to apply the transport or local IP change.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
             LabeledContent("Server", value: serverDescription)
             LabeledContent("Address of Record", value: settingsStore.settings.addressOfRecord ?? "Not configured")
             LabeledContent("Registration", value: registrationDescription)
@@ -265,7 +270,8 @@ private struct PhoneView: View {
     }
 
     private var transportMatches: Bool {
-        !isRunning || endpoint.activeTransport == settingsStore.settings.transport
+        !isRunning || (endpoint.activeTransport == settingsStore.settings.transport
+            && endpoint.activeLocalIPAddress == settingsStore.settings.localIPAddress)
     }
 
     private func startEndpoint() {
@@ -332,7 +338,8 @@ private struct PhoneView: View {
             rtpPort: UInt16(exactly: settingsStore.settings.rtpPortStart) ?? 4_000,
             audioInputDevice: Int32(exactly: settingsStore.settings.audioInputDeviceIndex ?? -1) ?? -1,
             audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -1) ?? -1,
-            allowSelfSignedCertificate: settingsStore.settings.allowSelfSignedCertificate
+            allowSelfSignedCertificate: settingsStore.settings.allowSelfSignedCertificate,
+            localIPAddress: settingsStore.settings.localIPAddress
         )
     }
 }
@@ -342,6 +349,8 @@ private struct SettingsView: View {
     @ObservedObject var logs: AppLogStore
     @State private var issues: [SIPSettingsValidationIssue] = []
     @State private var saved = false
+    @State private var localAddresses: [LocalIPAddress] = []
+    @State private var addressError: String?
 
     var body: some View {
         Form {
@@ -352,6 +361,23 @@ private struct SettingsView: View {
                     ForEach(SIPTransport.allCases) { Text($0.rawValue).tag($0) }
                 }
                 TextField("Local SIP port (0 = automatic)", value: $store.settings.localSIPPort, format: .number)
+                Picker("Local IP for SIP headers", selection: $store.settings.localIPAddress) {
+                    Text("Automatic").tag(nil as String?)
+                    ForEach(localAddresses) { item in
+                        Text("\(item.address) (\(item.interfaceName))").tag(Optional(item.address))
+                    }
+                    if let selected = store.settings.localIPAddress,
+                       !localAddresses.contains(where: { $0.address == selected }) {
+                        Text("\(selected) (unavailable)").tag(Optional(selected))
+                    }
+                }
+                Button("Refresh local IP addresses") { refreshLocalAddresses() }
+                Text("Used for Via, Contact and SDP. Stop and restart the endpoint after changing this setting. IPv6 link-local addresses are excluded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let addressError {
+                    Text(addressError).foregroundStyle(.red)
+                }
                 TextField("Outbound proxy (optional)", text: $store.settings.outboundProxy)
             }
 
@@ -412,6 +438,16 @@ private struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Settings")
+        .onAppear { refreshLocalAddresses() }
+    }
+
+    private func refreshLocalAddresses() {
+        do {
+            localAddresses = try LocalIPAddress.available()
+            addressError = nil
+        } catch {
+            addressError = "Could not list local IP addresses: \(error.localizedDescription)"
+        }
     }
 
     private var transportBinding: Binding<SIPTransport> {
