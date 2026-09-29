@@ -238,7 +238,7 @@ telephone-event を選択した状態で相手が対応していない場合の�
 | 6. DTMF | 完了 | 2026-09-29 | `0`～`9`、`*`、`#`の通話中キーパッド、telephone-event（payload 101、160 ms、終端処理はPJSIP）、送話音声経路へのin-bandトーン注入、SDP非対応時のin-band自動フォールバック、方式・結果ログを実装。ローカルSIP試験で両方式の選択を検証済み。NX-C1000との実機確認は未実施 |
 | 7. TCP／TLS | 完了 | 2026-09-29 | SIPトランスポート起動、Contact、REGISTER、INVITEをUDP／TCP／TLSで共通化。TLS 1.2/1.3、サーバー証明書検証の切替、`sip:`＋`transport=tls`／`sips:`切替を実装。ローカル試験でTCP/TLSリスナー起動とREGISTER接続開始を検証済み。NX-C1000とのTCP接続、TLSハンドシェイク、証明書相互接続は未実施 |
 | 8. エラー処理、セキュリティ、テスト整備 | 完了 | 2026-09-29 | SIP送受信の秘匿要約ログ、アプリ内表示・エクスポート、Authorization・Digest response・password・token・API key・URI内パスワードのマスキング、Keychain分離保存、状態別エラー表示を整備。着信中CANCELを正常終了へ分類し、UDP/TCP/TLS、REGISTER、発着信、音声、DTMF、競合、ログ秘匿を17自動テストで検証。Asterisk／FreeSWITCHおよびNX-C1000を用いたサーバー停止・認証失敗・TLS証明書エラー等の外部結合試験は未実施 |
-| 9. 配布用ビルドと署名 | 未着手 |  |  |
+| 9. 配布用ビルドと署名 | 完了 | 2026-09-29 | Release版のApple Silicon `.app`、ZIP、dSYMを再現可能に生成するスクリプトを追加。Info.plistにmacOS 27.0、バージョン、マイク利用目的を設定し、OpenSSL 4を同梱してHomebrew実行時依存を除去。PJSIP GPLおよびOpenSSL Apache 2.0のライセンス文・注意事項を同梱。決定どおりDeveloper ID署名・公証は行わず、Apple Siliconでの実行に必要なアドホック署名のみ実施 |
 
 ## 7. 着手前に決める項目
 

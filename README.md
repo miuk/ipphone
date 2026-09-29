@@ -17,7 +17,18 @@ swift test
 swift run IPPhoneApp
 ```
 
-マイルストーン8まで完了しています。
+## ローカル配布用ビルド
+
+```bash
+scripts/package_app.sh
+```
+
+`.build/distribution`へApple Silicon向けの`IPPhone.app`、受け渡し用ZIP、
+クラッシュ解析用dSYMを生成します。OpenSSLの実行時ライブラリと第三者
+ライセンス、マイク利用目的を同梱します。Developer ID署名とAppleの公証は
+行わず、ローカル実行に必要なアドホック署名だけを付与します。
+
+マイルストーン9まで完了しています。
 
 - PJSIP EndpointとUDPトランスポートの初期化・停止
 - SIP、アカウント、メディア、TLS設定と入力検証
@@ -33,5 +44,6 @@ swift run IPPhoneApp
 - TLS 1.2/1.3、サーバー証明書検証設定、`sip:`／`sips:`切替
 - 認証情報を含まないSIP送受信要約ログとログエクスポート
 - 秘密情報のマスキング、CANCEL競合を含むエラー・状態遷移テスト
+- Apple Silicon向けローカル配布用`.app`、ZIP、dSYM生成
 
-次のマイルストーンは配布用ビルドと署名です。
+計画した全マイルストーンを完了しています。
