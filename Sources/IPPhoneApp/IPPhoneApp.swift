@@ -81,6 +81,7 @@ private struct PhoneView: View {
             LabeledContent("Address of Record", value: settingsStore.settings.addressOfRecord ?? "Not configured")
             LabeledContent("Registration", value: registrationDescription)
             LabeledContent("Call", value: callDescription)
+            LabeledContent("Media", value: mediaDescription)
 
             HStack {
                 Button("Start UDP endpoint") {
@@ -112,6 +113,16 @@ private struct PhoneView: View {
                 } else {
                     Button("Hang Up") { endCall() }.disabled(!hasActiveCall)
                 }
+                Button(endpoint.isMuted ? "Unmute" : "Mute") {
+                    endpoint.setMuted(!endpoint.isMuted)
+                }
+                .disabled(!isMediaActive)
+            }
+            if isMediaActive {
+                LabeledContent(
+                    "RTP",
+                    value: "TX \(endpoint.rtpStatistics.transmittedPackets) / RX \(endpoint.rtpStatistics.receivedPackets) / Lost \(endpoint.rtpStatistics.lostPackets) / Jitter \(endpoint.rtpStatistics.jitterMicroseconds) μs"
+                )
             }
             if isIncoming {
                 Label("Incoming call", systemImage: "phone.arrow.down.left")
@@ -183,6 +194,19 @@ private struct PhoneView: View {
             && settingsStore.settings.validationIssues().isEmpty
     }
 
+    private var mediaDescription: String {
+        switch endpoint.mediaState {
+        case .idle: "Idle"
+        case .starting: "Starting…"
+        case let .active(codec): "\(codec) send/receive"
+        case let .failed(message): "Failed: \(message)"
+        }
+    }
+
+    private var isMediaActive: Bool {
+        if case .active = endpoint.mediaState { true } else { false }
+    }
+
     private var hasActiveCall: Bool {
         switch endpoint.callState {
         case .outgoing, .ringing, .incoming, .connected, .disconnecting: true
@@ -200,7 +224,7 @@ private struct PhoneView: View {
 
     private func startEndpoint() {
         do {
-            try endpoint.startUDP(port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0)
+            try startEndpointForCurrentSettings()
         } catch {
             logs.append(.error, category: "SIP", error.localizedDescription)
         }
@@ -208,7 +232,7 @@ private struct PhoneView: View {
 
     private func register() {
         do {
-            if !isRunning { try endpoint.startUDP(port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0) }
+            if !isRunning { try startEndpointForCurrentSettings() }
             try endpoint.register(settings: settingsStore.settings, password: settingsStore.password)
         } catch {
             logs.append(.error, category: "REGISTER", error.localizedDescription)
@@ -222,7 +246,7 @@ private struct PhoneView: View {
 
     private func makeCall() {
         do {
-            if !isRunning { try endpoint.startUDP(port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0) }
+            if !isRunning { try startEndpointForCurrentSettings() }
             try endpoint.makeCall(
                 destination: destination,
                 settings: settingsStore.settings,
@@ -241,6 +265,15 @@ private struct PhoneView: View {
     private func endCall(statusCode: Int = 603) {
         do { try endpoint.endCall(statusCode: statusCode) }
         catch { logs.append(.error, category: "Call", error.localizedDescription) }
+    }
+
+    private func startEndpointForCurrentSettings() throws {
+        try endpoint.startUDP(
+            port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0,
+            rtpPort: UInt16(exactly: settingsStore.settings.rtpPortStart) ?? 4_000,
+            audioInputDevice: Int32(exactly: settingsStore.settings.audioInputDeviceIndex ?? -1) ?? -1,
+            audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -1) ?? -1
+        )
     }
 }
 
@@ -277,6 +310,16 @@ private struct SettingsView: View {
                 }
                 TextField("RTP first port", value: $store.settings.rtpPortStart, format: .number)
                 TextField("RTP last port", value: $store.settings.rtpPortEnd, format: .number)
+                TextField(
+                    "Input device index (blank = default)",
+                    value: $store.settings.audioInputDeviceIndex,
+                    format: .number
+                )
+                TextField(
+                    "Output device index (blank = default)",
+                    value: $store.settings.audioOutputDeviceIndex,
+                    format: .number
+                )
             }
 
             Section("TLS") {

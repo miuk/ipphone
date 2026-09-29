@@ -29,6 +29,13 @@ typedef enum IPPJSIPCallState {
     IP_PJSIP_CALL_FAILED = 7
 } IPPJSIPCallState;
 
+typedef enum IPPJSIPMediaState {
+    IP_PJSIP_MEDIA_IDLE = 0,
+    IP_PJSIP_MEDIA_STARTING = 1,
+    IP_PJSIP_MEDIA_ACTIVE = 2,
+    IP_PJSIP_MEDIA_FAILED = 3
+} IPPJSIPMediaState;
+
 /// Creates an inert endpoint handle. Call `ip_pjsip_endpoint_start_udp` to
 /// initialize PJSIP and create a UDP transport.
 IPPJSIPEndpoint *ip_pjsip_endpoint_create(void);
@@ -38,6 +45,9 @@ IPPJSIPEndpoint *ip_pjsip_endpoint_create(void);
 bool ip_pjsip_endpoint_start_udp(
     IPPJSIPEndpoint *endpoint,
     uint16_t port,
+    uint16_t rtp_port,
+    int audio_input_device,
+    int audio_output_device,
     char *error_buffer,
     int error_buffer_length
 );
@@ -107,6 +117,15 @@ IPPJSIPCallState ip_pjsip_endpoint_call_state(const IPPJSIPEndpoint *endpoint);
 int ip_pjsip_endpoint_call_status_code(const IPPJSIPEndpoint *endpoint);
 const char *ip_pjsip_endpoint_call_message(const IPPJSIPEndpoint *endpoint);
 const char *ip_pjsip_endpoint_remote_uri(const IPPJSIPEndpoint *endpoint);
+
+IPPJSIPMediaState ip_pjsip_endpoint_media_state(const IPPJSIPEndpoint *endpoint);
+const char *ip_pjsip_endpoint_media_message(const IPPJSIPEndpoint *endpoint);
+bool ip_pjsip_endpoint_set_muted(IPPJSIPEndpoint *endpoint, bool muted);
+bool ip_pjsip_endpoint_is_muted(const IPPJSIPEndpoint *endpoint);
+uint32_t ip_pjsip_endpoint_rtp_tx_packets(const IPPJSIPEndpoint *endpoint);
+uint32_t ip_pjsip_endpoint_rtp_rx_packets(const IPPJSIPEndpoint *endpoint);
+uint32_t ip_pjsip_endpoint_rtp_rx_lost(const IPPJSIPEndpoint *endpoint);
+uint32_t ip_pjsip_endpoint_rtp_rx_jitter_usec(const IPPJSIPEndpoint *endpoint);
 
 /// Stops PJSIP. Safe to call more than once.
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint);

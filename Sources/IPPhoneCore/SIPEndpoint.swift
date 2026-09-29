@@ -26,6 +26,22 @@ public enum SIPCallState: Equatable, Sendable {
     case failed(statusCode: Int, message: String)
 }
 
+public enum SIPMediaState: Equatable, Sendable {
+    case idle
+    case starting
+    case active(codec: String)
+    case failed(message: String)
+}
+
+public struct RTPStatistics: Equatable, Sendable {
+    public var transmittedPackets: UInt32 = 0
+    public var receivedPackets: UInt32 = 0
+    public var lostPackets: UInt32 = 0
+    public var jitterMicroseconds: UInt32 = 0
+
+    public init() {}
+}
+
 public enum SIPEndpointError: LocalizedError, Equatable {
     case allocationFailed
     case startupFailed(String)
@@ -65,6 +81,9 @@ public final class SIPEndpoint: ObservableObject {
     @Published public private(set) var state: SIPEndpointState = .stopped
     @Published public private(set) var registrationState: SIPRegistrationState = .unregistered
     @Published public private(set) var callState: SIPCallState = .idle
+    @Published public private(set) var mediaState: SIPMediaState = .idle
+    @Published public private(set) var isMuted = false
+    @Published public private(set) var rtpStatistics = RTPStatistics()
 
     public let pjsipVersion: String
 
@@ -77,7 +96,12 @@ public final class SIPEndpoint: ObservableObject {
         logStore?.append(.info, category: "SIP", "PJSIP \(pjsipVersion) loaded")
     }
 
-    public func startUDP(port: UInt16 = 0) throws {
+    public func startUDP(
+        port: UInt16 = 0,
+        rtpPort: UInt16 = 4_000,
+        audioInputDevice: Int32 = -1,
+        audioOutputDevice: Int32 = -1
+    ) throws {
         guard handle == nil else {
             return
         }
@@ -91,6 +115,9 @@ public final class SIPEndpoint: ObservableObject {
         let started = ip_pjsip_endpoint_start_udp(
             newHandle,
             port,
+            rtpPort,
+            audioInputDevice,
+            audioOutputDevice,
             &errorBuffer,
             Int32(errorBuffer.count)
         )
@@ -248,6 +275,12 @@ public final class SIPEndpoint: ObservableObject {
         logStore?.append(.info, category: "Call", "Call termination initiated")
     }
 
+    public func setMuted(_ muted: Bool) {
+        guard let handle, ip_pjsip_endpoint_set_muted(handle.rawValue, muted) else { return }
+        isMuted = muted
+        logStore?.append(.info, category: "Media", muted ? "Microphone muted" : "Microphone unmuted")
+    }
+
     public func poll() {
         guard let handle else { return }
         ip_pjsip_endpoint_poll(handle.rawValue)
@@ -285,6 +318,39 @@ public final class SIPEndpoint: ObservableObject {
         }
 
         updateCallState(handle: handle.rawValue)
+        updateMediaState(handle: handle.rawValue)
+    }
+
+    private func updateMediaState(handle: OpaquePointer) {
+        let bridgeState = ip_pjsip_endpoint_media_state(handle)
+        let message = String(cString: ip_pjsip_endpoint_media_message(handle))
+        let newState: SIPMediaState
+        switch bridgeState.rawValue {
+        case IP_PJSIP_MEDIA_STARTING.rawValue:
+            newState = .starting
+        case IP_PJSIP_MEDIA_ACTIVE.rawValue:
+            newState = .active(codec: "PCMU/8000")
+        case IP_PJSIP_MEDIA_FAILED.rawValue:
+            newState = .failed(message: message)
+        default:
+            newState = .idle
+        }
+        if newState != mediaState {
+            mediaState = newState
+            switch newState {
+            case let .active(codec):
+                logStore?.append(.info, category: "Media", "Audio active: \(codec)")
+            case let .failed(message):
+                logStore?.append(.error, category: "Media", message)
+            case .idle, .starting:
+                break
+            }
+        }
+        isMuted = ip_pjsip_endpoint_is_muted(handle)
+        rtpStatistics.transmittedPackets = ip_pjsip_endpoint_rtp_tx_packets(handle)
+        rtpStatistics.receivedPackets = ip_pjsip_endpoint_rtp_rx_packets(handle)
+        rtpStatistics.lostPackets = ip_pjsip_endpoint_rtp_rx_lost(handle)
+        rtpStatistics.jitterMicroseconds = ip_pjsip_endpoint_rtp_rx_jitter_usec(handle)
     }
 
     private func updateCallState(handle: OpaquePointer) {
@@ -339,6 +405,9 @@ public final class SIPEndpoint: ObservableObject {
         state = .stopped
         registrationState = .unregistered
         callState = .idle
+        mediaState = .idle
+        isMuted = false
+        rtpStatistics = RTPStatistics()
         logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 

@@ -114,10 +114,19 @@ struct SIPEndpointTests {
         }
 
         try endpoint.answerCall()
+        endpoint.poll()
         guard case .connected = endpoint.callState else {
             Issue.record("Answered call did not enter connected state")
             return
         }
+        guard case .active(codec: "PCMU/8000") = endpoint.mediaState else {
+            Issue.record("PCMU media did not become active")
+            return
+        }
+        endpoint.setMuted(true)
+        #expect(endpoint.isMuted)
+        endpoint.setMuted(false)
+        #expect(!endpoint.isMuted)
     }
 
     private func sendInvite(to port: UInt16) throws {

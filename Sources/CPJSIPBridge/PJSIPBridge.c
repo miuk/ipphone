@@ -3,6 +3,10 @@
 #include <pjlib-util.h>
 #include <pj/rand.h>
 #include <pjnath.h>
+#include <pjmedia.h>
+#include <pjmedia/g711.h>
+#include <pjmedia/sound_port.h>
+#include <pjmedia/transport_udp.h>
 #include <pjsip.h>
 #include <pjsip_ua.h>
 #include <stdio.h>
@@ -20,7 +24,16 @@ struct IPPJSIPEndpoint {
     pjsip_inv_session *invite_session;
     pjsip_module app_module;
     pj_pool_t *call_pool;
+    pj_pool_t *media_pool;
+    pjmedia_endpt *media_endpoint;
+    pjmedia_event_mgr *media_event_manager;
+    pjmedia_transport *media_transport;
+    pjmedia_stream *media_stream;
+    pjmedia_snd_port *sound_port;
     uint16_t bound_port;
+    uint16_t rtp_port;
+    int audio_input_device;
+    int audio_output_device;
     IPPJSIPRegistrationState registration_state;
     int registration_status_code;
     uint32_t registration_expiration;
@@ -30,12 +43,141 @@ struct IPPJSIPEndpoint {
     char call_message[256];
     char remote_uri[PJSIP_MAX_URL_SIZE];
     bool local_termination;
+    bool audio_initialized;
+    bool g711_initialized;
+    bool muted;
+    IPPJSIPMediaState media_state;
+    char media_message[256];
 };
 
 static IPPJSIPEndpoint *active_endpoint = NULL;
 static pjsip_inv_callback invite_callbacks;
 
-static pjmedia_sdp_session *create_inactive_sdp(
+static void destroy_media(IPPJSIPEndpoint *endpoint) {
+    if (endpoint->sound_port != NULL) {
+        pjmedia_snd_port_disconnect(endpoint->sound_port);
+        pjmedia_snd_port_destroy(endpoint->sound_port);
+        endpoint->sound_port = NULL;
+    }
+    if (endpoint->media_stream != NULL) {
+        pjmedia_stream_destroy(endpoint->media_stream);
+        endpoint->media_stream = NULL;
+    }
+    if (endpoint->media_transport != NULL) {
+        pjmedia_transport_close(endpoint->media_transport);
+        endpoint->media_transport = NULL;
+    }
+    if (endpoint->audio_initialized) {
+        pjmedia_aud_subsys_shutdown();
+        endpoint->audio_initialized = false;
+    }
+    endpoint->muted = false;
+    endpoint->media_state = IP_PJSIP_MEDIA_IDLE;
+}
+
+static void set_media_error(IPPJSIPEndpoint *endpoint, const char *operation, pj_status_t status) {
+    char detail[PJ_ERR_MSG_SIZE];
+    pj_strerror(status, detail, sizeof(detail));
+    snprintf(
+        endpoint->media_message,
+        sizeof(endpoint->media_message),
+        "%s failed (%d): %s",
+        operation,
+        status,
+        detail
+    );
+    endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
+}
+
+static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
+    if (endpoint->media_stream != NULL || invite->neg == NULL) {
+        return;
+    }
+    endpoint->media_state = IP_PJSIP_MEDIA_STARTING;
+
+    const pjmedia_sdp_session *local_sdp = NULL;
+    const pjmedia_sdp_session *remote_sdp = NULL;
+    pj_status_t status = pjmedia_sdp_neg_get_active_local(invite->neg, &local_sdp);
+    if (status == PJ_SUCCESS) {
+        status = pjmedia_sdp_neg_get_active_remote(invite->neg, &remote_sdp);
+    }
+    if (status != PJ_SUCCESS || local_sdp == NULL || remote_sdp == NULL) {
+        set_media_error(endpoint, "SDP negotiation", status);
+        return;
+    }
+
+    pjmedia_stream_info info;
+    status = pjmedia_stream_info_from_sdp(
+        &info,
+        endpoint->call_pool,
+        endpoint->media_endpoint,
+        local_sdp,
+        remote_sdp,
+        0
+    );
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "pjmedia_stream_info_from_sdp", status);
+        return;
+    }
+    if (info.fmt.pt != 0) {
+        snprintf(endpoint->media_message, sizeof(endpoint->media_message), "Remote endpoint did not negotiate PCMU");
+        endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
+        return;
+    }
+
+    status = pjmedia_stream_create(
+        endpoint->media_endpoint,
+        endpoint->call_pool,
+        &info,
+        endpoint->media_transport,
+        endpoint,
+        &endpoint->media_stream
+    );
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "pjmedia_stream_create", status);
+        return;
+    }
+    status = pjmedia_stream_start(endpoint->media_stream);
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "pjmedia_stream_start", status);
+        return;
+    }
+
+    status = pjmedia_aud_subsys_init(&endpoint->caching_pool.factory);
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "pjmedia_aud_subsys_init", status);
+        return;
+    }
+    endpoint->audio_initialized = true;
+
+    pjmedia_port *stream_port = NULL;
+    status = pjmedia_stream_get_port(endpoint->media_stream, &stream_port);
+    if (status == PJ_SUCCESS) {
+        status = pjmedia_snd_port_create(
+            endpoint->call_pool,
+            endpoint->audio_input_device,
+            endpoint->audio_output_device,
+            8000,
+            1,
+            160,
+            16,
+            0,
+            &endpoint->sound_port
+        );
+    }
+    if (status == PJ_SUCCESS) {
+        status = pjmedia_snd_port_connect(endpoint->sound_port, stream_port);
+    }
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "Audio device", status);
+        return;
+    }
+
+    endpoint->media_state = IP_PJSIP_MEDIA_ACTIVE;
+    snprintf(endpoint->media_message, sizeof(endpoint->media_message), "PCMU 8000 Hz send/receive active");
+}
+
+static pjmedia_sdp_session *create_audio_sdp(
     IPPJSIPEndpoint *endpoint,
     uint16_t rtp_port
 ) {
@@ -54,6 +196,21 @@ static pjmedia_sdp_session *create_inactive_sdp(
 
     const pjsip_host_port *local = &endpoint->transport->local_name;
     const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
+    if (endpoint->media_transport == NULL) {
+        int address_family = ipv6 ? pj_AF_INET6() : pj_AF_INET();
+        if (pjmedia_transport_udp_create3(
+                endpoint->media_endpoint,
+                address_family,
+                "ipphone-rtp",
+                NULL,
+                rtp_port,
+                0,
+                &endpoint->media_transport
+            ) != PJ_SUCCESS) {
+            return NULL;
+        }
+        endpoint->rtp_port = rtp_port;
+    }
     char text[1024];
     int length = snprintf(
         text,
@@ -65,7 +222,7 @@ static pjmedia_sdp_session *create_inactive_sdp(
         "t=0 0\r\n"
         "m=audio %u RTP/AVP 0\r\n"
         "a=rtpmap:0 PCMU/8000\r\n"
-        "a=inactive\r\n",
+        "a=sendrecv\r\n",
         (unsigned)pj_rand(),
         (unsigned)pj_rand(),
         ipv6 ? "IP6" : "IP4",
@@ -145,6 +302,7 @@ static void invite_state_changed(pjsip_inv_session *invite, pjsip_event *event) 
             ? IP_PJSIP_CALL_ENDED
             : IP_PJSIP_CALL_FAILED;
         endpoint->invite_session = NULL;
+        destroy_media(endpoint);
         break;
     default:
         break;
@@ -165,10 +323,22 @@ static void invite_rx_offer(
     if (endpoint == NULL || endpoint->invite_session != invite) {
         return;
     }
-    pjmedia_sdp_session *answer = create_inactive_sdp(endpoint, 9);
+    pjmedia_sdp_session *answer = create_audio_sdp(endpoint, endpoint->rtp_port);
     if (answer != NULL) {
         pjsip_inv_set_sdp_answer(invite, answer);
     }
+}
+
+static void invite_media_update(pjsip_inv_session *invite, pj_status_t status) {
+    IPPJSIPEndpoint *endpoint = active_endpoint;
+    if (endpoint == NULL || endpoint->invite_session != invite) {
+        return;
+    }
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "SDP negotiation", status);
+        return;
+    }
+    start_media(endpoint, invite);
 }
 
 static pj_bool_t incoming_request(pjsip_rx_data *rdata) {
@@ -200,7 +370,7 @@ static pj_bool_t incoming_request(pjsip_rx_data *rdata) {
         return PJ_TRUE;
     }
 
-    pjmedia_sdp_session *sdp = create_inactive_sdp(endpoint, 9);
+    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, endpoint->rtp_port);
     status = pjsip_inv_create_uas(dialog, rdata, sdp, 0, &endpoint->invite_session);
     if (status != PJ_SUCCESS) {
         pjsip_dlg_dec_lock(dialog);
@@ -308,6 +478,9 @@ IPPJSIPEndpoint *ip_pjsip_endpoint_create(void) {
 bool ip_pjsip_endpoint_start_udp(
     IPPJSIPEndpoint *endpoint,
     uint16_t port,
+    uint16_t rtp_port,
+    int audio_input_device,
+    int audio_output_device,
     char *error_buffer,
     int error_buffer_length
 ) {
@@ -343,6 +516,49 @@ bool ip_pjsip_endpoint_start_udp(
 
     pj_caching_pool_init(&endpoint->caching_pool, NULL, 0);
     endpoint->pool_initialized = true;
+    endpoint->rtp_port = rtp_port;
+    endpoint->audio_input_device = audio_input_device;
+    endpoint->audio_output_device = audio_output_device;
+
+    status = pjmedia_endpt_create2(
+        &endpoint->caching_pool.factory,
+        NULL,
+        1,
+        &endpoint->media_endpoint
+    );
+    if (status != PJ_SUCCESS) {
+        copy_status_error(error_buffer, error_buffer_length, "pjmedia_endpt_create2", status);
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
+    status = pjmedia_codec_g711_init(endpoint->media_endpoint);
+    if (status != PJ_SUCCESS) {
+        copy_status_error(error_buffer, error_buffer_length, "pjmedia_codec_g711_init", status);
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
+    endpoint->g711_initialized = true;
+    endpoint->media_pool = pjmedia_endpt_create_pool(
+        endpoint->media_endpoint,
+        "ipphone-media",
+        1024,
+        1024
+    );
+    if (endpoint->media_pool == NULL) {
+        copy_error(error_buffer, error_buffer_length, "Unable to create media pool");
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
+    status = pjmedia_event_mgr_create(
+        endpoint->media_pool,
+        PJMEDIA_EVENT_MGR_NO_THREAD,
+        &endpoint->media_event_manager
+    );
+    if (status != PJ_SUCCESS) {
+        copy_status_error(error_buffer, error_buffer_length, "pjmedia_event_mgr_create", status);
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
 
     status = pjsip_endpt_create(
         &endpoint->caching_pool.factory,
@@ -390,6 +606,7 @@ bool ip_pjsip_endpoint_start_udp(
     invite_callbacks.on_state_changed = &invite_state_changed;
     invite_callbacks.on_new_session = &invite_new_session;
     invite_callbacks.on_rx_offer = &invite_rx_offer;
+    invite_callbacks.on_media_update = &invite_media_update;
     status = pjsip_inv_usage_init(endpoint->sip_endpoint, &invite_callbacks);
     if (status != PJ_SUCCESS) {
         copy_status_error(error_buffer, error_buffer_length, "pjsip_inv_usage_init", status);
@@ -622,7 +839,7 @@ bool ip_pjsip_endpoint_make_call(
         endpoint->call_pool = NULL;
     }
 
-    pjmedia_sdp_session *sdp = create_inactive_sdp(endpoint, rtp_port);
+    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, rtp_port);
     if (sdp == NULL) {
         copy_error(error_buffer, error_buffer_length, "Unable to create local SDP");
         return false;
@@ -774,6 +991,58 @@ const char *ip_pjsip_endpoint_remote_uri(const IPPJSIPEndpoint *endpoint) {
     return endpoint == NULL ? "" : endpoint->remote_uri;
 }
 
+IPPJSIPMediaState ip_pjsip_endpoint_media_state(const IPPJSIPEndpoint *endpoint) {
+    return endpoint == NULL ? IP_PJSIP_MEDIA_IDLE : endpoint->media_state;
+}
+
+const char *ip_pjsip_endpoint_media_message(const IPPJSIPEndpoint *endpoint) {
+    return endpoint == NULL ? "" : endpoint->media_message;
+}
+
+bool ip_pjsip_endpoint_set_muted(IPPJSIPEndpoint *endpoint, bool muted) {
+    if (endpoint == NULL || endpoint->media_stream == NULL) {
+        return false;
+    }
+    pj_status_t status = muted
+        ? pjmedia_stream_pause(endpoint->media_stream, PJMEDIA_DIR_ENCODING)
+        : pjmedia_stream_resume(endpoint->media_stream, PJMEDIA_DIR_ENCODING);
+    if (status == PJ_SUCCESS) {
+        endpoint->muted = muted;
+        return true;
+    }
+    return false;
+}
+
+bool ip_pjsip_endpoint_is_muted(const IPPJSIPEndpoint *endpoint) {
+    return endpoint != NULL && endpoint->muted;
+}
+
+static pjmedia_rtcp_stat media_stats(const IPPJSIPEndpoint *endpoint) {
+    pjmedia_rtcp_stat stats;
+    pj_bzero(&stats, sizeof(stats));
+    if (endpoint != NULL && endpoint->media_stream != NULL) {
+        pjmedia_stream_get_stat(endpoint->media_stream, &stats);
+    }
+    return stats;
+}
+
+uint32_t ip_pjsip_endpoint_rtp_tx_packets(const IPPJSIPEndpoint *endpoint) {
+    return media_stats(endpoint).tx.pkt;
+}
+
+uint32_t ip_pjsip_endpoint_rtp_rx_packets(const IPPJSIPEndpoint *endpoint) {
+    return media_stats(endpoint).rx.pkt;
+}
+
+uint32_t ip_pjsip_endpoint_rtp_rx_lost(const IPPJSIPEndpoint *endpoint) {
+    return media_stats(endpoint).rx.loss;
+}
+
+uint32_t ip_pjsip_endpoint_rtp_rx_jitter_usec(const IPPJSIPEndpoint *endpoint) {
+    int mean = media_stats(endpoint).rx.jitter.mean;
+    return mean > 0 ? (uint32_t)mean : 0;
+}
+
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint) {
     if (endpoint == NULL || !endpoint->pj_initialized) {
         return;
@@ -789,6 +1058,23 @@ void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint) {
     }
     if (active_endpoint == endpoint) {
         active_endpoint = NULL;
+    }
+    destroy_media(endpoint);
+    if (endpoint->g711_initialized) {
+        pjmedia_codec_g711_deinit();
+        endpoint->g711_initialized = false;
+    }
+    if (endpoint->media_endpoint != NULL) {
+        pjmedia_endpt_destroy(endpoint->media_endpoint);
+        endpoint->media_endpoint = NULL;
+    }
+    if (endpoint->media_event_manager != NULL) {
+        pjmedia_event_mgr_destroy(endpoint->media_event_manager);
+        endpoint->media_event_manager = NULL;
+    }
+    if (endpoint->media_pool != NULL) {
+        pj_pool_release(endpoint->media_pool);
+        endpoint->media_pool = NULL;
     }
     if (endpoint->call_pool != NULL) {
         pj_pool_release(endpoint->call_pool);

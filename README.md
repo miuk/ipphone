@@ -17,7 +17,7 @@ swift test
 swift run IPPhoneApp
 ```
 
-マイルストーン4まで完了しています。
+マイルストーン5まで完了しています。
 
 - PJSIP EndpointとUDPトランスポートの初期化・停止
 - SIP、アカウント、メディア、TLS設定と入力検証
@@ -25,6 +25,7 @@ swift run IPPhoneApp
 - OSLogとアプリ内ログ表示
 - UDPによるREGISTER、Digest認証、登録解除、自動更新
 - UDPによる発着信、応答、拒否、CANCEL、BYE
+- PCMU（8 kHz、mono）によるRTP音声の送受信とCore Audio入出力
+- 音声デバイス指定、マイクミュート、RTP送受信・損失・ジッター表示
 
-現在のSDPは音声を`inactive`としてネゴシエーションします。次のマイルストーンは
-PCMUによる双方向音声です。
+次のマイルストーンはDTMFです。

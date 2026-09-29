@@ -39,6 +39,8 @@ public struct SIPSettings: Codable, Equatable, Sendable {
     public var rtpPortStart: Int
     public var rtpPortEnd: Int
     public var outboundProxy: String
+    public var audioInputDeviceIndex: Int?
+    public var audioOutputDeviceIndex: Int?
 
     public init(
         serverHost: String = "",
@@ -55,7 +57,9 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         registrationExpiration: Int = 300,
         rtpPortStart: Int = 4_000,
         rtpPortEnd: Int = 4_999,
-        outboundProxy: String = ""
+        outboundProxy: String = "",
+        audioInputDeviceIndex: Int? = nil,
+        audioOutputDeviceIndex: Int? = nil
     ) {
         self.serverHost = serverHost
         self.serverPort = serverPort
@@ -72,6 +76,8 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         self.rtpPortStart = rtpPortStart
         self.rtpPortEnd = rtpPortEnd
         self.outboundProxy = outboundProxy
+        self.audioInputDeviceIndex = audioInputDeviceIndex
+        self.audioOutputDeviceIndex = audioOutputDeviceIndex
     }
 
     public var effectiveSIPDomain: String {
@@ -144,6 +150,12 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         {
             issues.append(.init(field: .rtpPortRange, message: "RTPポート範囲が正しくありません。"))
         }
+        if let index = audioInputDeviceIndex, index < 0 {
+            issues.append(.init(field: .audioDevice, message: "音声入力デバイスのインデックスが正しくありません。"))
+        }
+        if let index = audioOutputDeviceIndex, index < 0 {
+            issues.append(.init(field: .audioDevice, message: "音声出力デバイスのインデックスが正しくありません。"))
+        }
         return issues
     }
 
@@ -188,6 +200,7 @@ public enum SIPSettingsField: String, Sendable {
     case sipDomain
     case registrationExpiration
     case rtpPortRange
+    case audioDevice
 }
 
 public struct SIPSettingsValidationIssue: Equatable, Sendable {
