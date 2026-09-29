@@ -15,10 +15,22 @@ public enum SIPRegistrationState: Equatable, Sendable {
     case failed(statusCode: Int, message: String)
 }
 
+public enum SIPCallState: Equatable, Sendable {
+    case idle
+    case outgoing(remoteURI: String)
+    case ringing(remoteURI: String)
+    case incoming(remoteURI: String)
+    case connected(remoteURI: String)
+    case disconnecting
+    case ended(statusCode: Int, message: String)
+    case failed(statusCode: Int, message: String)
+}
+
 public enum SIPEndpointError: LocalizedError, Equatable {
     case allocationFailed
     case startupFailed(String)
     case registrationFailed(String)
+    case callFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -27,6 +39,8 @@ public enum SIPEndpointError: LocalizedError, Equatable {
         case let .startupFailed(message):
             message
         case let .registrationFailed(message):
+            message
+        case let .callFailed(message):
             message
         }
     }
@@ -50,6 +64,7 @@ private final class PJSIPHandle: @unchecked Sendable {
 public final class SIPEndpoint: ObservableObject {
     @Published public private(set) var state: SIPEndpointState = .stopped
     @Published public private(set) var registrationState: SIPRegistrationState = .unregistered
+    @Published public private(set) var callState: SIPCallState = .idle
 
     public let pjsipVersion: String
 
@@ -155,6 +170,84 @@ public final class SIPEndpoint: ObservableObject {
         logStore?.append(.info, category: "REGISTER", "Unregister sent")
     }
 
+    public func makeCall(
+        destination: String,
+        settings: SIPSettings,
+        password: String
+    ) throws {
+        guard let handle else {
+            throw SIPEndpointError.callFailed("SIP endpoint is not running.")
+        }
+        guard settings.transport == .udp, settings.validationIssues().isEmpty,
+              let localURI = settings.addressOfRecord,
+              let targetURI = settings.registrarURI,
+              let rtpPort = UInt16(exactly: settings.rtpPortStart)
+        else {
+            throw SIPEndpointError.callFailed("SIP settings are invalid or UDP is not selected.")
+        }
+        let destinationURI = try settings.destinationURI(for: destination)
+        var errorBuffer = [CChar](repeating: 0, count: 512)
+        let started = localURI.withCString { localURI in
+            destinationURI.withCString { destinationURI in
+                targetURI.withCString { targetURI in
+                    settings.userID.withCString { userID in
+                        password.withCString { password in
+                            ip_pjsip_endpoint_make_call(
+                                handle.rawValue,
+                                localURI,
+                                destinationURI,
+                                targetURI,
+                                userID,
+                                password,
+                                rtpPort,
+                                &errorBuffer,
+                                Int32(errorBuffer.count)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        guard started else {
+            let message = Self.decode(errorBuffer)
+            callState = .failed(statusCode: 0, message: message)
+            logStore?.append(.error, category: "Call", message)
+            throw SIPEndpointError.callFailed(message)
+        }
+        callState = .outgoing(remoteURI: destinationURI)
+        logStore?.append(.info, category: "Call", "INVITE sent to \(destinationURI)")
+    }
+
+    public func answerCall() throws {
+        guard let handle else { throw SIPEndpointError.callFailed("SIP endpoint is not running.") }
+        var errorBuffer = [CChar](repeating: 0, count: 512)
+        guard ip_pjsip_endpoint_answer_call(handle.rawValue, &errorBuffer, Int32(errorBuffer.count)) else {
+            let message = Self.decode(errorBuffer)
+            logStore?.append(.error, category: "Call", message)
+            throw SIPEndpointError.callFailed(message)
+        }
+        let remoteURI = String(cString: ip_pjsip_endpoint_remote_uri(handle.rawValue))
+        callState = .connected(remoteURI: remoteURI)
+        logStore?.append(.info, category: "Call", "Incoming call answered")
+    }
+
+    public func endCall(statusCode: Int = 603) throws {
+        guard let handle else { throw SIPEndpointError.callFailed("SIP endpoint is not running.") }
+        var errorBuffer = [CChar](repeating: 0, count: 512)
+        guard ip_pjsip_endpoint_end_call(
+            handle.rawValue,
+            Int32(statusCode),
+            &errorBuffer,
+            Int32(errorBuffer.count)
+        ) else {
+            let message = Self.decode(errorBuffer)
+            logStore?.append(.error, category: "Call", message)
+            throw SIPEndpointError.callFailed(message)
+        }
+        updateCallState(handle: handle.rawValue)
+        logStore?.append(.info, category: "Call", "Call termination initiated")
+    }
+
     public func poll() {
         guard let handle else { return }
         ip_pjsip_endpoint_poll(handle.rawValue)
@@ -177,16 +270,61 @@ public final class SIPEndpoint: ObservableObject {
             newState = .unregistered
         }
 
-        guard newState != registrationState else { return }
-        registrationState = newState
+        if newState != registrationState {
+            registrationState = newState
+            switch newState {
+            case let .registered(expiration):
+                logStore?.append(.info, category: "REGISTER", "Registered successfully (expires in \(expiration)s)")
+            case .unregistered:
+                logStore?.append(.info, category: "REGISTER", "Unregistered")
+            case let .failed(code, message):
+                logStore?.append(.error, category: "REGISTER", "Registration failed (SIP \(code)): \(message)")
+            case .registering, .unregistering:
+                break
+            }
+        }
+
+        updateCallState(handle: handle.rawValue)
+    }
+
+    private func updateCallState(handle: OpaquePointer) {
+        let bridgeState = ip_pjsip_endpoint_call_state(handle)
+        let code = Int(ip_pjsip_endpoint_call_status_code(handle))
+        let message = String(cString: ip_pjsip_endpoint_call_message(handle))
+        let remoteURI = String(cString: ip_pjsip_endpoint_remote_uri(handle))
+        let newState: SIPCallState
+        switch bridgeState.rawValue {
+        case IP_PJSIP_CALL_OUTGOING.rawValue:
+            newState = .outgoing(remoteURI: remoteURI)
+        case IP_PJSIP_CALL_RINGING.rawValue:
+            newState = .ringing(remoteURI: remoteURI)
+        case IP_PJSIP_CALL_INCOMING.rawValue:
+            newState = .incoming(remoteURI: remoteURI)
+        case IP_PJSIP_CALL_CONNECTED.rawValue:
+            newState = .connected(remoteURI: remoteURI)
+        case IP_PJSIP_CALL_DISCONNECTING.rawValue:
+            newState = .disconnecting
+        case IP_PJSIP_CALL_ENDED.rawValue:
+            newState = .ended(statusCode: code, message: message)
+        case IP_PJSIP_CALL_FAILED.rawValue:
+            newState = .failed(statusCode: code, message: message)
+        default:
+            newState = .idle
+        }
+        guard newState != callState else { return }
+        callState = newState
         switch newState {
-        case let .registered(expiration):
-            logStore?.append(.info, category: "REGISTER", "Registered successfully (expires in \(expiration)s)")
-        case .unregistered:
-            logStore?.append(.info, category: "REGISTER", "Unregistered")
+        case let .incoming(remote):
+            logStore?.append(.info, category: "Call", "Incoming call from \(remote)")
+        case let .ringing(remote):
+            logStore?.append(.info, category: "Call", "Remote endpoint is ringing: \(remote)")
+        case let .connected(remote):
+            logStore?.append(.info, category: "Call", "Call connected: \(remote)")
+        case let .ended(code, message):
+            logStore?.append(.info, category: "Call", "Call ended (SIP \(code)): \(message)")
         case let .failed(code, message):
-            logStore?.append(.error, category: "REGISTER", "Registration failed (SIP \(code)): \(message)")
-        case .registering, .unregistering:
+            logStore?.append(.error, category: "Call", "Call failed (SIP \(code)): \(message)")
+        case .idle, .outgoing, .disconnecting:
             break
         }
     }
@@ -200,6 +338,7 @@ public final class SIPEndpoint: ObservableObject {
         self.handle = nil
         state = .stopped
         registrationState = .unregistered
+        callState = .idle
         logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 

@@ -18,6 +18,17 @@ typedef enum IPPJSIPRegistrationState {
     IP_PJSIP_REGISTRATION_FAILED = 4
 } IPPJSIPRegistrationState;
 
+typedef enum IPPJSIPCallState {
+    IP_PJSIP_CALL_IDLE = 0,
+    IP_PJSIP_CALL_OUTGOING = 1,
+    IP_PJSIP_CALL_RINGING = 2,
+    IP_PJSIP_CALL_INCOMING = 3,
+    IP_PJSIP_CALL_CONNECTED = 4,
+    IP_PJSIP_CALL_DISCONNECTING = 5,
+    IP_PJSIP_CALL_ENDED = 6,
+    IP_PJSIP_CALL_FAILED = 7
+} IPPJSIPCallState;
+
 /// Creates an inert endpoint handle. Call `ip_pjsip_endpoint_start_udp` to
 /// initialize PJSIP and create a UDP transport.
 IPPJSIPEndpoint *ip_pjsip_endpoint_create(void);
@@ -62,6 +73,40 @@ IPPJSIPRegistrationState ip_pjsip_endpoint_registration_state(
 int ip_pjsip_endpoint_registration_status_code(const IPPJSIPEndpoint *endpoint);
 uint32_t ip_pjsip_endpoint_registration_expiration(const IPPJSIPEndpoint *endpoint);
 const char *ip_pjsip_endpoint_registration_message(const IPPJSIPEndpoint *endpoint);
+
+/// Sends an outgoing INVITE. Media is negotiated as inactive until milestone 5.
+bool ip_pjsip_endpoint_make_call(
+    IPPJSIPEndpoint *endpoint,
+    const char *local_uri,
+    const char *destination_uri,
+    const char *target_uri,
+    const char *user_id,
+    const char *password,
+    uint16_t rtp_port,
+    char *error_buffer,
+    int error_buffer_length
+);
+
+/// Answers the current incoming INVITE with 200 OK.
+bool ip_pjsip_endpoint_answer_call(
+    IPPJSIPEndpoint *endpoint,
+    char *error_buffer,
+    int error_buffer_length
+);
+
+/// Ends an outgoing, incoming, or established call using the appropriate
+/// SIP message (CANCEL, final response, or BYE).
+bool ip_pjsip_endpoint_end_call(
+    IPPJSIPEndpoint *endpoint,
+    int status_code,
+    char *error_buffer,
+    int error_buffer_length
+);
+
+IPPJSIPCallState ip_pjsip_endpoint_call_state(const IPPJSIPEndpoint *endpoint);
+int ip_pjsip_endpoint_call_status_code(const IPPJSIPEndpoint *endpoint);
+const char *ip_pjsip_endpoint_call_message(const IPPJSIPEndpoint *endpoint);
+const char *ip_pjsip_endpoint_remote_uri(const IPPJSIPEndpoint *endpoint);
 
 /// Stops PJSIP. Safe to call more than once.
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint);

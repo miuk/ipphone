@@ -70,6 +70,7 @@ private struct PhoneView: View {
     @ObservedObject var endpoint: SIPEndpoint
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logs: AppLogStore
+    @State private var destination = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -79,6 +80,7 @@ private struct PhoneView: View {
             LabeledContent("Server", value: serverDescription)
             LabeledContent("Address of Record", value: settingsStore.settings.addressOfRecord ?? "Not configured")
             LabeledContent("Registration", value: registrationDescription)
+            LabeledContent("Call", value: callDescription)
 
             HStack {
                 Button("Start UDP endpoint") {
@@ -93,6 +95,27 @@ private struct PhoneView: View {
                     .keyboardShortcut("r", modifiers: .command)
                 Button("Unregister") { unregister() }
                     .disabled(!canUnregister)
+            }
+            Divider()
+            TextField("Destination number or SIP URI", text: $destination)
+                .textFieldStyle(.roundedBorder)
+                .disabled(hasActiveCall)
+                .onSubmit { makeCall() }
+            HStack {
+                Button("Call") { makeCall() }
+                    .disabled(!canMakeCall)
+                    .keyboardShortcut(.return, modifiers: [])
+                if isIncoming {
+                    Button("Answer") { answerCall() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Reject") { endCall(statusCode: 486) }
+                } else {
+                    Button("Hang Up") { endCall() }.disabled(!hasActiveCall)
+                }
+            }
+            if isIncoming {
+                Label("Incoming call", systemImage: "phone.arrow.down.left")
+                    .font(.title2).foregroundStyle(.orange)
             }
             Spacer()
         }
@@ -140,6 +163,37 @@ private struct PhoneView: View {
         if case .registered = endpoint.registrationState { true } else { false }
     }
 
+    private var callDescription: String {
+        switch endpoint.callState {
+        case .idle: "Idle"
+        case let .outgoing(remote): "Calling \(remote)…"
+        case let .ringing(remote): "Ringing \(remote)…"
+        case let .incoming(remote): "Incoming from \(remote)"
+        case let .connected(remote): "Connected to \(remote)"
+        case .disconnecting: "Disconnecting…"
+        case let .ended(code, message): "Ended (SIP \(code)): \(message)"
+        case let .failed(code, message): code == 0 ? "Failed: \(message)" : "Failed (SIP \(code)): \(message)"
+        }
+    }
+
+    private var canMakeCall: Bool {
+        !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !hasActiveCall
+            && settingsStore.settings.transport == .udp
+            && settingsStore.settings.validationIssues().isEmpty
+    }
+
+    private var hasActiveCall: Bool {
+        switch endpoint.callState {
+        case .outgoing, .ringing, .incoming, .connected, .disconnecting: true
+        case .idle, .ended, .failed: false
+        }
+    }
+
+    private var isIncoming: Bool {
+        if case .incoming = endpoint.callState { true } else { false }
+    }
+
     private var isRegistered: Bool {
         if case .registered = endpoint.registrationState { true } else { false }
     }
@@ -164,6 +218,29 @@ private struct PhoneView: View {
     private func unregister() {
         do { try endpoint.unregister() }
         catch { logs.append(.error, category: "REGISTER", error.localizedDescription) }
+    }
+
+    private func makeCall() {
+        do {
+            if !isRunning { try endpoint.startUDP(port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0) }
+            try endpoint.makeCall(
+                destination: destination,
+                settings: settingsStore.settings,
+                password: settingsStore.password
+            )
+        } catch {
+            logs.append(.error, category: "Call", error.localizedDescription)
+        }
+    }
+
+    private func answerCall() {
+        do { try endpoint.answerCall() }
+        catch { logs.append(.error, category: "Call", error.localizedDescription) }
+    }
+
+    private func endCall(statusCode: Int = 603) {
+        do { try endpoint.endCall(statusCode: statusCode) }
+        catch { logs.append(.error, category: "Call", error.localizedDescription) }
     }
 }
 
