@@ -74,17 +74,20 @@ public final class AppLogStore: ObservableObject {
 
     public static func redactingSecrets(in message: String) -> String {
         let patterns = [
-            #"(?i)(password\s*[=:]\s*)[^\s,;]+"#,
-            #"(?i)(response\s*=\s*\")[^\"]+"#,
-            #"(?i)(authorization\s*:\s*)[^\r\n]+"#,
+            (#"(?i)(password\s*[=:]\s*)[^\s,;]+"#, "$1<redacted>"),
+            (#"(?i)((?:api[_-]?key|token|secret)\s*[=:]\s*)[^\s,;]+"#, "$1<redacted>"),
+            (#"(?i)(response\s*=\s*\")[^\"]+"#, "$1<redacted>"),
+            (#"(?i)((?:proxy-)?authorization\s*:\s*)[^\r\n]+"#, "$1<redacted>"),
+            (#"(?i)(sips?:[^\s:@]+:)[^\s@;>]+(@)"#, "$1<redacted>$2"),
         ]
-        return patterns.reduce(message) { result, pattern in
+        return patterns.reduce(message) { result, item in
+            let (pattern, replacement) = item
             guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
             let range = NSRange(result.startIndex..., in: result)
             return regex.stringByReplacingMatches(
                 in: result,
                 range: range,
-                withTemplate: "$1<redacted>"
+                withTemplate: replacement
             )
         }
     }

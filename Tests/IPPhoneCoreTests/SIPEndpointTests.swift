@@ -50,7 +50,8 @@ struct SIPEndpointTests {
 
     @Test
     func startsUDPRegistrationTransaction() throws {
-        let endpoint = SIPEndpoint()
+        let logs = AppLogStore()
+        let endpoint = SIPEndpoint(logStore: logs)
         try endpoint.startUDP(port: 0)
         defer { endpoint.stop() }
 
@@ -64,6 +65,10 @@ struct SIPEndpointTests {
         try endpoint.register(settings: settings, password: "test-password")
 
         #expect(endpoint.registrationState == .registering)
+        endpoint.poll()
+        #expect(logs.entries.contains { $0.category == "SIP Message" && $0.message.contains("TX request REGISTER") })
+        #expect(!logs.exportedText.contains("test-password"))
+        #expect(!logs.exportedText.localizedCaseInsensitiveContains("Authorization:"))
     }
 
     @Test
@@ -114,6 +119,39 @@ struct SIPEndpointTests {
         try endpoint.endCall(statusCode: 486)
         guard case .ended(statusCode: 486, _) = endpoint.callState else {
             Issue.record("Rejected call did not enter ended state")
+            return
+        }
+    }
+
+    @Test
+    func handlesCancelWhileIncomingCallIsRinging() throws {
+        let endpoint = SIPEndpoint()
+        try endpoint.startUDP(port: 0)
+        defer { endpoint.stop() }
+        guard case let .running(port) = endpoint.state else {
+            Issue.record("Endpoint did not start")
+            return
+        }
+
+        try sendInvite(to: port)
+        for _ in 0..<20 {
+            endpoint.poll()
+            if case .incoming = endpoint.callState { break }
+            usleep(10_000)
+        }
+        guard case .incoming = endpoint.callState else {
+            Issue.record("Call did not enter incoming state")
+            return
+        }
+
+        try sendCancel(to: port)
+        for _ in 0..<20 {
+            endpoint.poll()
+            if case .ended = endpoint.callState { break }
+            usleep(10_000)
+        }
+        guard case .ended = endpoint.callState else {
+            Issue.record("Cancelled incoming call did not end")
             return
         }
     }
@@ -221,6 +259,38 @@ struct SIPEndpointTests {
         \(sdp)
         """
 
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let addressLength = socklen_t(address.sin_len)
+        let sent = message.withCString { bytes in
+            withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                    sendto(descriptor, bytes, message.utf8.count, 0, socketAddress, addressLength)
+                }
+            }
+        }
+        try #require(sent == message.utf8.count)
+    }
+
+    private func sendCancel(to port: UInt16) throws {
+        let message = """
+        CANCEL sip:1001@127.0.0.1 SIP/2.0\r
+        Via: SIP/2.0/UDP 127.0.0.1:5099;branch=z9hG4bK-test-invite\r
+        Max-Forwards: 70\r
+        From: <sip:2002@127.0.0.1>;tag=test-from\r
+        To: <sip:1001@127.0.0.1>\r
+        Call-ID: test-call@127.0.0.1\r
+        CSeq: 1 CANCEL\r
+        Content-Length: 0\r
+        \r
+
+        """
+        let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(descriptor >= 0)
+        defer { close(descriptor) }
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)

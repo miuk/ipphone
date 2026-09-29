@@ -22,6 +22,9 @@ typedef struct DTMFInjectPort {
     pjmedia_port *tone_generator;
 } DTMFInjectPort;
 
+#define IP_PJSIP_LOG_CAPACITY 32
+#define IP_PJSIP_LOG_LENGTH 256
+
 struct IPPJSIPEndpoint {
     bool pj_initialized;
     bool pool_initialized;
@@ -34,6 +37,7 @@ struct IPPJSIPEndpoint {
     pjsip_regc *registration_client;
     pjsip_inv_session *invite_session;
     pjsip_module app_module;
+    pjsip_module log_module;
     pj_pool_t *call_pool;
     pj_pool_t *media_pool;
     pjmedia_endpt *media_endpoint;
@@ -62,10 +66,72 @@ struct IPPJSIPEndpoint {
     bool telephone_event_available;
     IPPJSIPMediaState media_state;
     char media_message[256];
+    char sip_logs[IP_PJSIP_LOG_CAPACITY][IP_PJSIP_LOG_LENGTH];
+    unsigned sip_log_head;
+    unsigned sip_log_count;
 };
 
 static IPPJSIPEndpoint *active_endpoint = NULL;
 static pjsip_inv_callback invite_callbacks;
+
+static void push_sip_log(IPPJSIPEndpoint *endpoint, const char *direction, pjsip_msg *message) {
+    if (endpoint == NULL || message == NULL) {
+        return;
+    }
+    unsigned index = (endpoint->sip_log_head + endpoint->sip_log_count) % IP_PJSIP_LOG_CAPACITY;
+    if (endpoint->sip_log_count == IP_PJSIP_LOG_CAPACITY) {
+        endpoint->sip_log_head = (endpoint->sip_log_head + 1) % IP_PJSIP_LOG_CAPACITY;
+        index = (endpoint->sip_log_head + endpoint->sip_log_count - 1) % IP_PJSIP_LOG_CAPACITY;
+    } else {
+        endpoint->sip_log_count++;
+    }
+    pjsip_cseq_hdr *cseq = PJSIP_MSG_CSEQ_HDR(message);
+    unsigned cseq_number = cseq == NULL ? 0 : (unsigned)cseq->cseq;
+    if (message->type == PJSIP_REQUEST_MSG) {
+        snprintf(
+            endpoint->sip_logs[index],
+            IP_PJSIP_LOG_LENGTH,
+            "%s request %.*s (CSeq %u)",
+            direction,
+            (int)message->line.req.method.name.slen,
+            message->line.req.method.name.ptr,
+            cseq_number
+        );
+    } else {
+        snprintf(
+            endpoint->sip_logs[index],
+            IP_PJSIP_LOG_LENGTH,
+            "%s response %d %.*s (CSeq %u %.*s)",
+            direction,
+            message->line.status.code,
+            (int)message->line.status.reason.slen,
+            message->line.status.reason.ptr,
+            cseq_number,
+            cseq == NULL ? 0 : (int)cseq->method.name.slen,
+            cseq == NULL ? "" : cseq->method.name.ptr
+        );
+    }
+}
+
+static pj_bool_t log_rx_request(pjsip_rx_data *rdata) {
+    push_sip_log(active_endpoint, "RX", rdata->msg_info.msg);
+    return PJ_FALSE;
+}
+
+static pj_bool_t log_rx_response(pjsip_rx_data *rdata) {
+    push_sip_log(active_endpoint, "RX", rdata->msg_info.msg);
+    return PJ_FALSE;
+}
+
+static pj_status_t log_tx_request(pjsip_tx_data *tdata) {
+    push_sip_log(active_endpoint, "TX", tdata->msg);
+    return PJ_SUCCESS;
+}
+
+static pj_status_t log_tx_response(pjsip_tx_data *tdata) {
+    push_sip_log(active_endpoint, "TX", tdata->msg);
+    return PJ_SUCCESS;
+}
 
 static const pjsip_host_port *endpoint_local_name(const IPPJSIPEndpoint *endpoint) {
     if (endpoint->transport != NULL) {
@@ -403,7 +469,9 @@ static void invite_state_changed(pjsip_inv_session *invite, pjsip_event *event) 
             (int)invite->cause_text.slen,
             invite->cause_text.ptr == NULL ? "" : invite->cause_text.ptr
         );
-        endpoint->call_state = endpoint->local_termination || invite->cause < 300
+        endpoint->call_state = endpoint->local_termination
+                || invite->cause < 300
+                || invite->cause == PJSIP_SC_REQUEST_TERMINATED
             ? IP_PJSIP_CALL_ENDED
             : IP_PJSIP_CALL_FAILED;
         endpoint->invite_session = NULL;
@@ -718,6 +786,23 @@ bool ip_pjsip_endpoint_start(
     status = pjsip_inv_usage_init(endpoint->sip_endpoint, &invite_callbacks);
     if (status != PJ_SUCCESS) {
         copy_status_error(error_buffer, error_buffer_length, "pjsip_inv_usage_init", status);
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
+
+    pj_bzero(&endpoint->log_module, sizeof(endpoint->log_module));
+    endpoint->log_module.name = pj_str("mod-ipphone-log");
+    endpoint->log_module.id = -1;
+    endpoint->log_module.priority = PJSIP_MOD_PRIORITY_TRANSPORT_LAYER + 1;
+    endpoint->log_module.on_rx_request = &log_rx_request;
+    endpoint->log_module.on_rx_response = &log_rx_response;
+    endpoint->log_module.on_tx_request = &log_tx_request;
+    endpoint->log_module.on_tx_response = &log_tx_response;
+    active_endpoint = endpoint;
+    status = pjsip_endpt_register_module(endpoint->sip_endpoint, &endpoint->log_module);
+    if (status != PJ_SUCCESS) {
+        active_endpoint = NULL;
+        copy_status_error(error_buffer, error_buffer_length, "pjsip log module", status);
         ip_pjsip_endpoint_stop(endpoint);
         return false;
     }
@@ -1292,6 +1377,20 @@ bool ip_pjsip_endpoint_send_dtmf(
 
 bool ip_pjsip_endpoint_telephone_event_available(const IPPJSIPEndpoint *endpoint) {
     return endpoint != NULL && endpoint->telephone_event_available;
+}
+
+bool ip_pjsip_endpoint_pop_sip_log(
+    IPPJSIPEndpoint *endpoint,
+    char *buffer,
+    int buffer_length
+) {
+    if (endpoint == NULL || buffer == NULL || buffer_length <= 0 || endpoint->sip_log_count == 0) {
+        return false;
+    }
+    snprintf(buffer, (size_t)buffer_length, "%s", endpoint->sip_logs[endpoint->sip_log_head]);
+    endpoint->sip_log_head = (endpoint->sip_log_head + 1) % IP_PJSIP_LOG_CAPACITY;
+    endpoint->sip_log_count--;
+    return true;
 }
 
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint) {

@@ -166,6 +166,14 @@ bool ip_pjsip_endpoint_send_dtmf(
 );
 bool ip_pjsip_endpoint_telephone_event_available(const IPPJSIPEndpoint *endpoint);
 
+/// Removes the oldest sanitized SIP message summary from the diagnostic
+/// queue. Message bodies and authentication header values are never stored.
+bool ip_pjsip_endpoint_pop_sip_log(
+    IPPJSIPEndpoint *endpoint,
+    char *buffer,
+    int buffer_length
+);
+
 /// Stops PJSIP. Safe to call more than once.
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint);
 

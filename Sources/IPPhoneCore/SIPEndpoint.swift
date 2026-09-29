@@ -370,6 +370,7 @@ public final class SIPEndpoint: ObservableObject {
     public func poll() {
         guard let handle else { return }
         ip_pjsip_endpoint_poll(handle.rawValue)
+        drainSIPLogs(handle: handle.rawValue)
 
         let bridgeState = ip_pjsip_endpoint_registration_state(handle.rawValue)
         let code = Int(ip_pjsip_endpoint_registration_status_code(handle.rawValue))
@@ -405,6 +406,14 @@ public final class SIPEndpoint: ObservableObject {
 
         updateCallState(handle: handle.rawValue)
         updateMediaState(handle: handle.rawValue)
+    }
+
+    private func drainSIPLogs(handle: OpaquePointer) {
+        var buffer = [CChar](repeating: 0, count: 256)
+        while ip_pjsip_endpoint_pop_sip_log(handle, &buffer, Int32(buffer.count)) {
+            logStore?.append(.debug, category: "SIP Message", Self.decode(buffer))
+            buffer = [CChar](repeating: 0, count: 256)
+        }
     }
 
     private func updateMediaState(handle: OpaquePointer) {

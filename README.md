@@ -17,7 +17,7 @@ swift test
 swift run IPPhoneApp
 ```
 
-マイルストーン7まで完了しています。
+マイルストーン8まで完了しています。
 
 - PJSIP EndpointとUDPトランスポートの初期化・停止
 - SIP、アカウント、メディア、TLS設定と入力検証
@@ -31,5 +31,7 @@ swift run IPPhoneApp
 - telephone-event非対応時のin-band自動フォールバックと通話中キーパッド
 - UDP、TCP、TLSによるREGISTER・発着信経路
 - TLS 1.2/1.3、サーバー証明書検証設定、`sip:`／`sips:`切替
+- 認証情報を含まないSIP送受信要約ログとログエクスポート
+- 秘密情報のマスキング、CANCEL競合を含むエラー・状態遷移テスト
 
-次のマイルストーンはエラー処理、セキュリティ、テスト整備です。
+次のマイルストーンは配布用ビルドと署名です。
