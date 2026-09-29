@@ -5,6 +5,7 @@ import SwiftUI
 
 @main
 struct IPPhoneApp: App {
+    @NSApplicationDelegateAdaptor(IPPhoneAppDelegate.self) private var appDelegate
     @StateObject private var logStore: AppLogStore
     @StateObject private var settingsStore: SettingsStore
     @StateObject private var endpoint: SIPEndpoint
@@ -21,6 +22,18 @@ struct IPPhoneApp: App {
             ContentView(endpoint: endpoint, settingsStore: settingsStore, logStore: logStore)
                 .frame(minWidth: 760, minHeight: 560)
         }
+    }
+}
+
+@MainActor
+private final class IPPhoneAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Direct executable launches also need normal GUI activation behavior.
+        NSApplication.shared.setActivationPolicy(.regular)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApplication.shared.activate()
     }
 }
 

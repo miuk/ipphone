@@ -123,12 +123,37 @@ static pj_bool_t log_rx_response(pjsip_rx_data *rdata) {
     return PJ_FALSE;
 }
 
+static void enclose_from_to_uris(pjsip_tx_data *tdata) {
+    pj_bool_t changed = PJ_FALSE;
+    for (pjsip_hdr *header = tdata->msg->hdr.next;
+         header != &tdata->msg->hdr;
+         header = header->next) {
+        if (header->type != PJSIP_H_FROM && header->type != PJSIP_H_TO) {
+            continue;
+        }
+        pjsip_fromto_hdr *fromto = (pjsip_fromto_hdr *)header;
+        // Existing name-addr objects already print angle brackets and retain
+        // their display names. Wrap only bare URIs, leaving header tags intact.
+        if (fromto->uri != NULL && pjsip_uri_get_uri(fromto->uri) == fromto->uri) {
+            pjsip_name_addr *name_addr = pjsip_name_addr_create(tdata->pool);
+            name_addr->uri = fromto->uri;
+            fromto->uri = (pjsip_uri *)name_addr;
+            changed = PJ_TRUE;
+        }
+    }
+    if (changed) {
+        pjsip_tx_data_invalidate_msg(tdata);
+    }
+}
+
 static pj_status_t log_tx_request(pjsip_tx_data *tdata) {
+    enclose_from_to_uris(tdata);
     push_sip_log(active_endpoint, "TX", tdata->msg);
     return PJ_SUCCESS;
 }
 
 static pj_status_t log_tx_response(pjsip_tx_data *tdata) {
+    enclose_from_to_uris(tdata);
     push_sip_log(active_endpoint, "TX", tdata->msg);
     return PJ_SUCCESS;
 }
@@ -1141,6 +1166,12 @@ bool ip_pjsip_endpoint_make_call(
         copy_status_error(error_buffer, error_buffer_length, "pjsip_dlg_create_uac", status);
         return false;
     }
+
+    // Address the called party at the configured SIP server. The remote
+    // identity supplies the user, while the target retains server routing.
+    pjsip_sip_uri *remote_sip_uri = pjsip_uri_get_uri(dialog->remote.info->uri);
+    pjsip_sip_uri *target_sip_uri = pjsip_uri_get_uri(dialog->target);
+    pj_strdup(dialog->pool, &target_sip_uri->user, &remote_sip_uri->user);
 
     pjsip_cred_info credential;
     pj_bzero(&credential, sizeof(credential));

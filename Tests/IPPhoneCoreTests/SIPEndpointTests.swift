@@ -72,6 +72,79 @@ struct SIPEndpointTests {
     }
 
     @Test
+    func enclosesOutgoingFromAndToURIs() throws {
+        let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(descriptor >= 0)
+        defer { close(descriptor) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var addressLength = socklen_t(address.sin_len)
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(descriptor, $0, addressLength)
+            }
+        }
+        try #require(bound == 0)
+        let named = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(descriptor, $0, &addressLength)
+            }
+        }
+        try #require(named == 0)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        try #require(setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                               socklen_t(MemoryLayout<timeval>.size)) == 0)
+
+        let endpoint = SIPEndpoint()
+        try endpoint.startUDP(port: 0)
+        defer { endpoint.stop() }
+        let settings = SIPSettings(
+            serverHost: "127.0.0.1",
+            serverPort: Int(address.sin_port.bigEndian),
+            userID: "1001",
+            phoneNumber: "1001"
+        )
+        try endpoint.register(settings: settings, password: "test-password")
+        let registration = try receiveMessage(descriptor: descriptor)
+        #expect(registration.hasPrefix("REGISTER "))
+        #expect(registration.contains("\r\nFrom: <sip:1001@127.0.0.1>;tag="))
+        #expect(registration.contains("\r\nTo: <sip:1001@127.0.0.1>\r\n"))
+
+        try endpoint.makeCall(destination: "1002", settings: settings, password: "test-password")
+        let invite = try receiveMessage(descriptor: descriptor)
+        #expect(invite.hasPrefix("INVITE sip:1002@127.0.0.1:\(settings.serverPort);transport=udp SIP/2.0\r\n"))
+        #expect(invite.contains("\r\nFrom: <sip:1001@127.0.0.1>;tag="))
+        #expect(invite.contains("\r\nTo: <sip:1002@127.0.0.1>\r\n"))
+
+        guard case let .running(port) = endpoint.state else {
+            Issue.record("Endpoint did not start")
+            return
+        }
+        // An INVITE during the outgoing call produces a stateless busy
+        // response. Bare incoming URIs must be enclosed in that response too.
+        try sendInvite(to: port, senderDescriptor: descriptor, bareURIs: true)
+        for _ in 0..<5 {
+            endpoint.poll()
+            usleep(10_000)
+        }
+        let response = try receiveMessage(descriptor: descriptor)
+        #expect(response.hasPrefix("SIP/2.0 486 "))
+        #expect(response.contains("\r\nFrom: <sip:2002@127.0.0.1>;tag=test-from\r\n"))
+        #expect(response.contains("\r\nTo: <sip:1001@127.0.0.1>;tag="))
+    }
+
+    private func receiveMessage(descriptor: Int32) throws -> String {
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let received = buffer.withUnsafeMutableBytes {
+            recv(descriptor, $0.baseAddress, $0.count, 0)
+        }
+        try #require(received > 0)
+        return String(decoding: buffer.prefix(received), as: UTF8.self)
+    }
+
+    @Test
     func sendsOutgoingInviteAndStartsCancellation() throws {
         let endpoint = SIPEndpoint()
         try endpoint.startUDP(port: 0)
@@ -224,10 +297,15 @@ struct SIPEndpointTests {
         #expect(!result.usedFallback)
     }
 
-    private func sendInvite(to port: UInt16, supportsTelephoneEvent: Bool = false) throws {
-        let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    private func sendInvite(
+        to port: UInt16,
+        supportsTelephoneEvent: Bool = false,
+        senderDescriptor: Int32? = nil,
+        bareURIs: Bool = false
+    ) throws {
+        let descriptor = senderDescriptor ?? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         try #require(descriptor >= 0)
-        defer { close(descriptor) }
+        defer { if senderDescriptor == nil { close(descriptor) } }
 
         let eventPayload = supportsTelephoneEvent ? " 101" : ""
         let eventAttributes = supportsTelephoneEvent
@@ -246,10 +324,10 @@ struct SIPEndpointTests {
         """
         let message = """
         INVITE sip:1001@127.0.0.1 SIP/2.0\r
-        Via: SIP/2.0/UDP 127.0.0.1:5099;branch=z9hG4bK-test-invite\r
+        Via: SIP/2.0/UDP 127.0.0.1:5099\(senderDescriptor == nil ? "" : ";rport");branch=z9hG4bK-test-invite\r
         Max-Forwards: 70\r
-        From: <sip:2002@127.0.0.1>;tag=test-from\r
-        To: <sip:1001@127.0.0.1>\r
+        From: \(bareURIs ? "sip:2002@127.0.0.1" : "<sip:2002@127.0.0.1>");tag=test-from\r
+        To: \(bareURIs ? "sip:1001@127.0.0.1" : "<sip:1001@127.0.0.1>")\r
         Call-ID: test-call@127.0.0.1\r
         CSeq: 1 INVITE\r
         Contact: <sip:2002@127.0.0.1:5099>\r
