@@ -6,12 +6,19 @@
 #include <pjmedia.h>
 #include <pjmedia/g711.h>
 #include <pjmedia/sound_port.h>
+#include <pjmedia/tonegen.h>
 #include <pjmedia/transport_udp.h>
 #include <pjsip.h>
 #include <pjsip_ua.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef struct DTMFInjectPort {
+    pjmedia_port base;
+    pjmedia_port *stream_port;
+    pjmedia_port *tone_generator;
+} DTMFInjectPort;
 
 struct IPPJSIPEndpoint {
     bool pj_initialized;
@@ -30,6 +37,8 @@ struct IPPJSIPEndpoint {
     pjmedia_transport *media_transport;
     pjmedia_stream *media_stream;
     pjmedia_snd_port *sound_port;
+    DTMFInjectPort *dtmf_inject_port;
+    pjmedia_port *tone_generator;
     uint16_t bound_port;
     uint16_t rtp_port;
     int audio_input_device;
@@ -46,6 +55,7 @@ struct IPPJSIPEndpoint {
     bool audio_initialized;
     bool g711_initialized;
     bool muted;
+    bool telephone_event_available;
     IPPJSIPMediaState media_state;
     char media_message[256];
 };
@@ -53,12 +63,71 @@ struct IPPJSIPEndpoint {
 static IPPJSIPEndpoint *active_endpoint = NULL;
 static pjsip_inv_callback invite_callbacks;
 
+static pj_status_t dtmf_inject_put_frame(pjmedia_port *port, pjmedia_frame *frame) {
+    DTMFInjectPort *injector = (DTMFInjectPort *)port;
+    if (pjmedia_tonegen_is_busy(injector->tone_generator)) {
+        pj_status_t status = pjmedia_port_get_frame(injector->tone_generator, frame);
+        if (status != PJ_SUCCESS) {
+            return status;
+        }
+    }
+    return pjmedia_port_put_frame(injector->stream_port, frame);
+}
+
+static pj_status_t dtmf_inject_get_frame(pjmedia_port *port, pjmedia_frame *frame) {
+    DTMFInjectPort *injector = (DTMFInjectPort *)port;
+    return pjmedia_port_get_frame(injector->stream_port, frame);
+}
+
+static pj_status_t create_dtmf_inject_port(
+    IPPJSIPEndpoint *endpoint,
+    pjmedia_port *stream_port
+) {
+    DTMFInjectPort *injector = PJ_POOL_ZALLOC_T(endpoint->call_pool, DTMFInjectPort);
+    pj_str_t name = pj_str("dtmf-inject");
+    pj_status_t status = pjmedia_port_info_init(
+        &injector->base.info,
+        &name,
+        PJMEDIA_SIG_CLASS_PORT('D', 'T', 'F'),
+        8000,
+        1,
+        16,
+        160
+    );
+    if (status != PJ_SUCCESS) {
+        return status;
+    }
+    status = pjmedia_tonegen_create(
+        endpoint->call_pool,
+        8000,
+        1,
+        160,
+        16,
+        0,
+        &injector->tone_generator
+    );
+    if (status != PJ_SUCCESS) {
+        return status;
+    }
+    injector->stream_port = stream_port;
+    injector->base.put_frame = &dtmf_inject_put_frame;
+    injector->base.get_frame = &dtmf_inject_get_frame;
+    endpoint->dtmf_inject_port = injector;
+    endpoint->tone_generator = injector->tone_generator;
+    return PJ_SUCCESS;
+}
+
 static void destroy_media(IPPJSIPEndpoint *endpoint) {
     if (endpoint->sound_port != NULL) {
         pjmedia_snd_port_disconnect(endpoint->sound_port);
         pjmedia_snd_port_destroy(endpoint->sound_port);
         endpoint->sound_port = NULL;
     }
+    if (endpoint->tone_generator != NULL) {
+        pjmedia_port_destroy(endpoint->tone_generator);
+        endpoint->tone_generator = NULL;
+    }
+    endpoint->dtmf_inject_port = NULL;
     if (endpoint->media_stream != NULL) {
         pjmedia_stream_destroy(endpoint->media_stream);
         endpoint->media_stream = NULL;
@@ -72,6 +141,7 @@ static void destroy_media(IPPJSIPEndpoint *endpoint) {
         endpoint->audio_initialized = false;
     }
     endpoint->muted = false;
+    endpoint->telephone_event_available = false;
     endpoint->media_state = IP_PJSIP_MEDIA_IDLE;
 }
 
@@ -124,6 +194,7 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
         endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
         return;
     }
+    endpoint->telephone_event_available = info.tx_event_pt >= 0;
 
     status = pjmedia_stream_create(
         endpoint->media_endpoint,
@@ -153,6 +224,9 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
     pjmedia_port *stream_port = NULL;
     status = pjmedia_stream_get_port(endpoint->media_stream, &stream_port);
     if (status == PJ_SUCCESS) {
+        status = create_dtmf_inject_port(endpoint, stream_port);
+    }
+    if (status == PJ_SUCCESS) {
         status = pjmedia_snd_port_create(
             endpoint->call_pool,
             endpoint->audio_input_device,
@@ -166,7 +240,7 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
         );
     }
     if (status == PJ_SUCCESS) {
-        status = pjmedia_snd_port_connect(endpoint->sound_port, stream_port);
+        status = pjmedia_snd_port_connect(endpoint->sound_port, &endpoint->dtmf_inject_port->base);
     }
     if (status != PJ_SUCCESS) {
         set_media_error(endpoint, "Audio device", status);
@@ -220,8 +294,10 @@ static pjmedia_sdp_session *create_audio_sdp(
         "s=IPPhone\r\n"
         "c=IN %s %.*s\r\n"
         "t=0 0\r\n"
-        "m=audio %u RTP/AVP 0\r\n"
+        "m=audio %u RTP/AVP 0 101\r\n"
         "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:101 telephone-event/8000\r\n"
+        "a=fmtp:101 0-16\r\n"
         "a=sendrecv\r\n",
         (unsigned)pj_rand(),
         (unsigned)pj_rand(),
@@ -1041,6 +1117,75 @@ uint32_t ip_pjsip_endpoint_rtp_rx_lost(const IPPJSIPEndpoint *endpoint) {
 uint32_t ip_pjsip_endpoint_rtp_rx_jitter_usec(const IPPJSIPEndpoint *endpoint) {
     int mean = media_stats(endpoint).rx.jitter.mean;
     return mean > 0 ? (uint32_t)mean : 0;
+}
+
+bool ip_pjsip_endpoint_send_dtmf(
+    IPPJSIPEndpoint *endpoint,
+    char digit,
+    IPPJSIPDTMFMode requested_mode,
+    uint32_t duration_milliseconds,
+    IPPJSIPDTMFMode *used_mode,
+    char *error_buffer,
+    int error_buffer_length
+) {
+    if (endpoint == NULL || endpoint->media_stream == NULL
+        || endpoint->media_state != IP_PJSIP_MEDIA_ACTIVE) {
+        copy_error(error_buffer, error_buffer_length, "DTMF requires an active audio call");
+        return false;
+    }
+    if (!((digit >= '0' && digit <= '9') || digit == '*' || digit == '#')) {
+        copy_error(error_buffer, error_buffer_length, "Invalid DTMF digit");
+        return false;
+    }
+    if (duration_milliseconds < 40 || duration_milliseconds > 5000) {
+        copy_error(error_buffer, error_buffer_length, "DTMF duration must be between 40 and 5000 ms");
+        return false;
+    }
+
+    IPPJSIPDTMFMode actual_mode = requested_mode;
+    if (actual_mode == IP_PJSIP_DTMF_TELEPHONE_EVENT
+        && !endpoint->telephone_event_available) {
+        actual_mode = IP_PJSIP_DTMF_IN_BAND;
+    }
+    if (used_mode != NULL) {
+        *used_mode = actual_mode;
+    }
+
+    pj_status_t status;
+    if (actual_mode == IP_PJSIP_DTMF_TELEPHONE_EVENT) {
+        char digit_text[] = {digit, '\0'};
+        pj_str_t digits = pj_str(digit_text);
+        status = pjmedia_stream_dial_dtmf2(
+            endpoint->media_stream,
+            &digits,
+            duration_milliseconds
+        );
+    } else {
+        if (endpoint->muted) {
+            copy_error(error_buffer, error_buffer_length, "Unmute the microphone before sending in-band DTMF");
+            return false;
+        }
+        if (endpoint->tone_generator == NULL) {
+            copy_error(error_buffer, error_buffer_length, "In-band DTMF generator is unavailable");
+            return false;
+        }
+        pjmedia_tone_digit tone = {
+            .digit = digit,
+            .on_msec = (short)duration_milliseconds,
+            .off_msec = 50,
+            .volume = 0
+        };
+        status = pjmedia_tonegen_play_digits(endpoint->tone_generator, 1, &tone, 0);
+    }
+    if (status != PJ_SUCCESS) {
+        copy_status_error(error_buffer, error_buffer_length, "Send DTMF", status);
+        return false;
+    }
+    return true;
+}
+
+bool ip_pjsip_endpoint_telephone_event_available(const IPPJSIPEndpoint *endpoint) {
+    return endpoint != NULL && endpoint->telephone_event_available;
 }
 
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint) {

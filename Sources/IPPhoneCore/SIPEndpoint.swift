@@ -42,6 +42,13 @@ public struct RTPStatistics: Equatable, Sendable {
     public init() {}
 }
 
+public struct DTMFSendResult: Equatable, Sendable {
+    public let requestedMode: DTMFMode
+    public let usedMode: DTMFMode
+
+    public var usedFallback: Bool { requestedMode != usedMode }
+}
+
 public enum SIPEndpointError: LocalizedError, Equatable {
     case allocationFailed
     case startupFailed(String)
@@ -84,6 +91,7 @@ public final class SIPEndpoint: ObservableObject {
     @Published public private(set) var mediaState: SIPMediaState = .idle
     @Published public private(set) var isMuted = false
     @Published public private(set) var rtpStatistics = RTPStatistics()
+    @Published public private(set) var telephoneEventAvailable = false
 
     public let pjsipVersion: String
 
@@ -281,6 +289,45 @@ public final class SIPEndpoint: ObservableObject {
         logStore?.append(.info, category: "Media", muted ? "Microphone muted" : "Microphone unmuted")
     }
 
+    @discardableResult
+    public func sendDTMF(
+        _ digit: Character,
+        mode: DTMFMode,
+        durationMilliseconds: UInt32 = 160
+    ) throws -> DTMFSendResult {
+        guard let handle else { throw SIPEndpointError.callFailed("SIP endpoint is not running.") }
+        guard digit.isASCII, let ascii = digit.asciiValue else {
+            throw SIPEndpointError.callFailed("Invalid DTMF digit.")
+        }
+        var usedMode = IP_PJSIP_DTMF_TELEPHONE_EVENT
+        var errorBuffer = [CChar](repeating: 0, count: 512)
+        let requestedMode = mode == .telephoneEvent
+            ? IP_PJSIP_DTMF_TELEPHONE_EVENT
+            : IP_PJSIP_DTMF_IN_BAND
+        guard ip_pjsip_endpoint_send_dtmf(
+            handle.rawValue,
+            CChar(bitPattern: ascii),
+            requestedMode,
+            durationMilliseconds,
+            &usedMode,
+            &errorBuffer,
+            Int32(errorBuffer.count)
+        ) else {
+            let message = Self.decode(errorBuffer)
+            logStore?.append(.error, category: "DTMF", message)
+            throw SIPEndpointError.callFailed(message)
+        }
+        let actual: DTMFMode = usedMode == IP_PJSIP_DTMF_IN_BAND ? .inBand : .telephoneEvent
+        let result = DTMFSendResult(requestedMode: mode, usedMode: actual)
+        let fallback = result.usedFallback ? " (automatic fallback from telephone-event)" : ""
+        logStore?.append(
+            result.usedFallback ? .warning : .info,
+            category: "DTMF",
+            "Sent \(digit) using \(actual.rawValue), duration \(durationMilliseconds) ms\(fallback)"
+        )
+        return result
+    }
+
     public func poll() {
         guard let handle else { return }
         ip_pjsip_endpoint_poll(handle.rawValue)
@@ -347,6 +394,7 @@ public final class SIPEndpoint: ObservableObject {
             }
         }
         isMuted = ip_pjsip_endpoint_is_muted(handle)
+        telephoneEventAvailable = ip_pjsip_endpoint_telephone_event_available(handle)
         rtpStatistics.transmittedPackets = ip_pjsip_endpoint_rtp_tx_packets(handle)
         rtpStatistics.receivedPackets = ip_pjsip_endpoint_rtp_rx_packets(handle)
         rtpStatistics.lostPackets = ip_pjsip_endpoint_rtp_rx_lost(handle)
@@ -408,6 +456,7 @@ public final class SIPEndpoint: ObservableObject {
         mediaState = .idle
         isMuted = false
         rtpStatistics = RTPStatistics()
+        telephoneEventAvailable = false
         logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 

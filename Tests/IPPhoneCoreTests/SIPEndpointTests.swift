@@ -127,21 +127,57 @@ struct SIPEndpointTests {
         #expect(endpoint.isMuted)
         endpoint.setMuted(false)
         #expect(!endpoint.isMuted)
+
+        #expect(!endpoint.telephoneEventAvailable)
+        let fallback = try endpoint.sendDTMF("5", mode: .telephoneEvent, durationMilliseconds: 100)
+        #expect(fallback.requestedMode == .telephoneEvent)
+        #expect(fallback.usedMode == .inBand)
+        #expect(fallback.usedFallback)
     }
 
-    private func sendInvite(to port: UInt16) throws {
+    @Test
+    func sendsNegotiatedTelephoneEvent() throws {
+        let endpoint = SIPEndpoint()
+        try endpoint.startUDP(port: 0)
+        defer { endpoint.stop() }
+        guard case let .running(port) = endpoint.state else {
+            Issue.record("Endpoint did not start")
+            return
+        }
+
+        try sendInvite(to: port, supportsTelephoneEvent: true)
+        for _ in 0..<20 {
+            endpoint.poll()
+            if case .incoming = endpoint.callState { break }
+            usleep(10_000)
+        }
+        try endpoint.answerCall()
+        endpoint.poll()
+
+        #expect(endpoint.telephoneEventAvailable)
+        let result = try endpoint.sendDTMF("#", mode: .telephoneEvent, durationMilliseconds: 160)
+        #expect(result.usedMode == .telephoneEvent)
+        #expect(!result.usedFallback)
+    }
+
+    private func sendInvite(to port: UInt16, supportsTelephoneEvent: Bool = false) throws {
         let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         try #require(descriptor >= 0)
         defer { close(descriptor) }
 
+        let eventPayload = supportsTelephoneEvent ? " 101" : ""
+        let eventAttributes = supportsTelephoneEvent
+            ? "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\n"
+            : ""
         let sdp = """
         v=0\r
         o=- 1 1 IN IP4 127.0.0.1\r
         s=Test\r
         c=IN IP4 127.0.0.1\r
         t=0 0\r
-        m=audio 5000 RTP/AVP 0\r
+        m=audio 5000 RTP/AVP 0\(eventPayload)\r
         a=rtpmap:0 PCMU/8000\r
+        \(eventAttributes)
 
         """
         let message = """

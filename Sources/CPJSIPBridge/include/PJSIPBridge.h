@@ -36,6 +36,11 @@ typedef enum IPPJSIPMediaState {
     IP_PJSIP_MEDIA_FAILED = 3
 } IPPJSIPMediaState;
 
+typedef enum IPPJSIPDTMFMode {
+    IP_PJSIP_DTMF_TELEPHONE_EVENT = 0,
+    IP_PJSIP_DTMF_IN_BAND = 1
+} IPPJSIPDTMFMode;
+
 /// Creates an inert endpoint handle. Call `ip_pjsip_endpoint_start_udp` to
 /// initialize PJSIP and create a UDP transport.
 IPPJSIPEndpoint *ip_pjsip_endpoint_create(void);
@@ -84,7 +89,7 @@ int ip_pjsip_endpoint_registration_status_code(const IPPJSIPEndpoint *endpoint);
 uint32_t ip_pjsip_endpoint_registration_expiration(const IPPJSIPEndpoint *endpoint);
 const char *ip_pjsip_endpoint_registration_message(const IPPJSIPEndpoint *endpoint);
 
-/// Sends an outgoing INVITE. Media is negotiated as inactive until milestone 5.
+/// Sends an outgoing INVITE with PCMU and telephone-event media capabilities.
 bool ip_pjsip_endpoint_make_call(
     IPPJSIPEndpoint *endpoint,
     const char *local_uri,
@@ -126,6 +131,20 @@ uint32_t ip_pjsip_endpoint_rtp_tx_packets(const IPPJSIPEndpoint *endpoint);
 uint32_t ip_pjsip_endpoint_rtp_rx_packets(const IPPJSIPEndpoint *endpoint);
 uint32_t ip_pjsip_endpoint_rtp_rx_lost(const IPPJSIPEndpoint *endpoint);
 uint32_t ip_pjsip_endpoint_rtp_rx_jitter_usec(const IPPJSIPEndpoint *endpoint);
+
+/// Sends one DTMF digit for the active call. If telephone-event is requested
+/// but was not negotiated, the digit is sent in-band and `used_mode` reports
+/// the fallback.
+bool ip_pjsip_endpoint_send_dtmf(
+    IPPJSIPEndpoint *endpoint,
+    char digit,
+    IPPJSIPDTMFMode requested_mode,
+    uint32_t duration_milliseconds,
+    IPPJSIPDTMFMode *used_mode,
+    char *error_buffer,
+    int error_buffer_length
+);
+bool ip_pjsip_endpoint_telephone_event_available(const IPPJSIPEndpoint *endpoint);
 
 /// Stops PJSIP. Safe to call more than once.
 void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint);

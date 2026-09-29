@@ -71,6 +71,7 @@ private struct PhoneView: View {
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logs: AppLogStore
     @State private var destination = ""
+    @State private var dtmfStatus = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -123,6 +124,26 @@ private struct PhoneView: View {
                     "RTP",
                     value: "TX \(endpoint.rtpStatistics.transmittedPackets) / RX \(endpoint.rtpStatistics.receivedPackets) / Lost \(endpoint.rtpStatistics.lostPackets) / Jitter \(endpoint.rtpStatistics.jitterMicroseconds) μs"
                 )
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("DTMF").font(.headline)
+                        Text(dtmfCapabilityDescription).foregroundStyle(.secondary)
+                    }
+                    Grid(horizontalSpacing: 8, verticalSpacing: 8) {
+                        ForEach([["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["*", "0", "#"]], id: \.self) { row in
+                            GridRow {
+                                ForEach(row, id: \.self) { digit in
+                                    Button(digit) { sendDTMF(digit) }
+                                        .frame(minWidth: 48)
+                                        .buttonStyle(.bordered)
+                                }
+                            }
+                        }
+                    }
+                    if !dtmfStatus.isEmpty {
+                        Text(dtmfStatus).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
             if isIncoming {
                 Label("Incoming call", systemImage: "phone.arrow.down.left")
@@ -207,6 +228,14 @@ private struct PhoneView: View {
         if case .active = endpoint.mediaState { true } else { false }
     }
 
+    private var dtmfCapabilityDescription: String {
+        let configured = settingsStore.settings.dtmfMode
+        if configured == .telephoneEvent && !endpoint.telephoneEventAvailable {
+            return "telephone-event unavailable; automatic in-band fallback"
+        }
+        return configured.rawValue
+    }
+
     private var hasActiveCall: Bool {
         switch endpoint.callState {
         case .outgoing, .ringing, .incoming, .connected, .disconnecting: true
@@ -265,6 +294,18 @@ private struct PhoneView: View {
     private func endCall(statusCode: Int = 603) {
         do { try endpoint.endCall(statusCode: statusCode) }
         catch { logs.append(.error, category: "Call", error.localizedDescription) }
+    }
+
+    private func sendDTMF(_ text: String) {
+        guard let digit = text.first else { return }
+        do {
+            let result = try endpoint.sendDTMF(digit, mode: settingsStore.settings.dtmfMode)
+            dtmfStatus = result.usedFallback
+                ? "Sent \(digit) using in-band fallback"
+                : "Sent \(digit) using \(result.usedMode.rawValue)"
+        } catch {
+            dtmfStatus = error.localizedDescription
+        }
     }
 
     private func startEndpointForCurrentSettings() throws {
