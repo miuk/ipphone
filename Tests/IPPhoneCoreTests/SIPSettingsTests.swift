@@ -37,6 +37,17 @@ struct SIPSettingsTests {
     }
 
     @Test
+    func buildsSIPSRegistrarWhenConfigured() {
+        let settings = SIPSettings(
+            serverHost: "sip.example.test",
+            serverPort: 5061,
+            transport: .tls,
+            tlsURIScheme: .sips
+        )
+        #expect(settings.registrarURI == "sips:sip.example.test:5061")
+    }
+
+    @Test
     func reportsRequiredAndRangeValidationIssues() {
         let issues = SIPSettings().validationIssues()
         #expect(issues.contains { $0.field == .serverHost })

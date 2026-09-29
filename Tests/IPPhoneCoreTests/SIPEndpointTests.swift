@@ -23,6 +23,32 @@ struct SIPEndpointTests {
     }
 
     @Test
+    func startsTCPAndTLSTransports() throws {
+        for transport in [SIPTransport.tcp, .tls] {
+            let endpoint = SIPEndpoint()
+            try endpoint.start(transport: transport, port: 0)
+            guard case let .running(port) = endpoint.state else {
+                Issue.record("\(transport.rawValue) endpoint did not enter the running state")
+                continue
+            }
+            #expect(port > 0)
+            #expect(endpoint.activeTransport == transport)
+
+            let settings = SIPSettings(
+                serverHost: "127.0.0.1",
+                serverPort: 9,
+                transport: transport,
+                userID: "1001",
+                phoneNumber: "1001"
+            )
+            try endpoint.register(settings: settings, password: "test-password")
+            #expect(endpoint.registrationState == .registering)
+            endpoint.stop()
+            #expect(endpoint.state == .stopped)
+        }
+    }
+
+    @Test
     func startsUDPRegistrationTransaction() throws {
         let endpoint = SIPEndpoint()
         try endpoint.startUDP(port: 0)

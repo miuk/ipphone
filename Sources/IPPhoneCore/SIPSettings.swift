@@ -95,7 +95,11 @@ public struct SIPSettings: Codable, Equatable, Sendable {
     public var registrarURI: String? {
         let host = serverHost.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty, (1...65_535).contains(serverPort) else { return nil }
-        return "sip:\(formattedHost(host)):\(serverPort);transport=\(transport.rawValue.lowercased())"
+        let scheme = transport == .tls ? tlsURIScheme.rawValue : "sip"
+        let transportParameter = transport == .tls && tlsURIScheme == .sips
+            ? ""
+            : ";transport=\(transport.rawValue.lowercased())"
+        return "\(scheme):\(formattedHost(host)):\(serverPort)\(transportParameter)"
     }
 
     public func destinationURI(for input: String) throws -> String {

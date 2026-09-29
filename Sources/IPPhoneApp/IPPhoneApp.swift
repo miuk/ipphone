@@ -85,10 +85,10 @@ private struct PhoneView: View {
             LabeledContent("Media", value: mediaDescription)
 
             HStack {
-                Button("Start UDP endpoint") {
+                Button("Start \(settingsStore.settings.transport.rawValue) endpoint") {
                     startEndpoint()
                 }
-                .disabled(isRunning || settingsStore.settings.transport != .udp)
+                .disabled(isRunning)
                 Button("Stop") { endpoint.stop() }.disabled(!isRunning)
             }
             HStack {
@@ -162,7 +162,7 @@ private struct PhoneView: View {
     private var stateDescription: String {
         switch endpoint.state {
         case .stopped: "Stopped"
-        case let .running(port): "UDP listening on port \(port)"
+        case let .running(port): "\(endpoint.activeTransport?.rawValue ?? "SIP") listening on port \(port)"
         case let .failed(message): "Failed: \(message)"
         }
     }
@@ -184,8 +184,8 @@ private struct PhoneView: View {
     }
 
     private var canRegister: Bool {
-        settingsStore.settings.transport == .udp
-            && settingsStore.settings.validationIssues().isEmpty
+        settingsStore.settings.validationIssues().isEmpty
+            && transportMatches
             && endpoint.registrationState != .registering
             && endpoint.registrationState != .unregistering
             && !isRegistered
@@ -211,8 +211,8 @@ private struct PhoneView: View {
     private var canMakeCall: Bool {
         !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !hasActiveCall
-            && settingsStore.settings.transport == .udp
             && settingsStore.settings.validationIssues().isEmpty
+            && transportMatches
     }
 
     private var mediaDescription: String {
@@ -249,6 +249,10 @@ private struct PhoneView: View {
 
     private var isRegistered: Bool {
         if case .registered = endpoint.registrationState { true } else { false }
+    }
+
+    private var transportMatches: Bool {
+        !isRunning || endpoint.activeTransport == settingsStore.settings.transport
     }
 
     private func startEndpoint() {
@@ -309,11 +313,13 @@ private struct PhoneView: View {
     }
 
     private func startEndpointForCurrentSettings() throws {
-        try endpoint.startUDP(
+        try endpoint.start(
+            transport: settingsStore.settings.transport,
             port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0,
             rtpPort: UInt16(exactly: settingsStore.settings.rtpPortStart) ?? 4_000,
             audioInputDevice: Int32(exactly: settingsStore.settings.audioInputDeviceIndex ?? -1) ?? -1,
-            audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -1) ?? -1
+            audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -1) ?? -1,
+            allowSelfSignedCertificate: settingsStore.settings.allowSelfSignedCertificate
         )
     }
 }
@@ -364,7 +370,10 @@ private struct SettingsView: View {
             }
 
             Section("TLS") {
-                Toggle("Allow self-signed certificates", isOn: $store.settings.allowSelfSignedCertificate)
+                Toggle(
+                    "Allow self-signed certificates (disable server verification)",
+                    isOn: $store.settings.allowSelfSignedCertificate
+                )
                 Picker("URI scheme", selection: $store.settings.tlsURIScheme) {
                     ForEach(TLSURIScheme.allCases) { Text("\($0.rawValue):").tag($0) }
                 }

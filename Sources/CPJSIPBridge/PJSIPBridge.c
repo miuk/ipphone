@@ -9,6 +9,8 @@
 #include <pjmedia/tonegen.h>
 #include <pjmedia/transport_udp.h>
 #include <pjsip.h>
+#include <pjsip/sip_transport_tcp.h>
+#include <pjsip/sip_transport_tls.h>
 #include <pjsip_ua.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,8 @@ struct IPPJSIPEndpoint {
     pj_caching_pool caching_pool;
     pjsip_endpoint *sip_endpoint;
     pjsip_transport *transport;
+    pjsip_tpfactory *transport_factory;
+    IPPJSIPTransport transport_kind;
     pjsip_regc *registration_client;
     pjsip_inv_session *invite_session;
     pjsip_module app_module;
@@ -62,6 +66,28 @@ struct IPPJSIPEndpoint {
 
 static IPPJSIPEndpoint *active_endpoint = NULL;
 static pjsip_inv_callback invite_callbacks;
+
+static const pjsip_host_port *endpoint_local_name(const IPPJSIPEndpoint *endpoint) {
+    if (endpoint->transport != NULL) {
+        return &endpoint->transport->local_name;
+    }
+    if (endpoint->transport_factory != NULL) {
+        return &endpoint->transport_factory->addr_name;
+    }
+    return NULL;
+}
+
+static const char *endpoint_transport_name(const IPPJSIPEndpoint *endpoint) {
+    switch (endpoint->transport_kind) {
+    case IP_PJSIP_TRANSPORT_TCP:
+        return "tcp";
+    case IP_PJSIP_TRANSPORT_TLS:
+        return "tls";
+    case IP_PJSIP_TRANSPORT_UDP:
+    default:
+        return "udp";
+    }
+}
 
 static pj_status_t dtmf_inject_put_frame(pjmedia_port *port, pjmedia_frame *frame) {
     DTMFInjectPort *injector = (DTMFInjectPort *)port;
@@ -268,7 +294,10 @@ static pjmedia_sdp_session *create_audio_sdp(
         return NULL;
     }
 
-    const pjsip_host_port *local = &endpoint->transport->local_name;
+    const pjsip_host_port *local = endpoint_local_name(endpoint);
+    if (local == NULL) {
+        return NULL;
+    }
     const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
     if (endpoint->media_transport == NULL) {
         int address_family = ipv6 ? pj_AF_INET6() : pj_AF_INET();
@@ -551,12 +580,14 @@ IPPJSIPEndpoint *ip_pjsip_endpoint_create(void) {
     return calloc(1, sizeof(IPPJSIPEndpoint));
 }
 
-bool ip_pjsip_endpoint_start_udp(
+bool ip_pjsip_endpoint_start(
     IPPJSIPEndpoint *endpoint,
+    IPPJSIPTransport transport_kind,
     uint16_t port,
     uint16_t rtp_port,
     int audio_input_device,
     int audio_output_device,
+    bool allow_self_signed_certificate,
     char *error_buffer,
     int error_buffer_length
 ) {
@@ -595,6 +626,7 @@ bool ip_pjsip_endpoint_start_udp(
     endpoint->rtp_port = rtp_port;
     endpoint->audio_input_device = audio_input_device;
     endpoint->audio_output_device = audio_output_device;
+    endpoint->transport_kind = transport_kind;
 
     status = pjmedia_endpt_create2(
         &endpoint->caching_pool.factory,
@@ -706,28 +738,88 @@ bool ip_pjsip_endpoint_start_udp(
 
     pj_sockaddr_in address;
     pj_sockaddr_in_init(&address, NULL, port);
-    status = pjsip_udp_transport_start(
-        endpoint->sip_endpoint,
-        &address,
-        NULL,
-        1,
-        &endpoint->transport
-    );
+    const char *transport_operation = NULL;
+    switch (transport_kind) {
+    case IP_PJSIP_TRANSPORT_UDP:
+        transport_operation = "pjsip_udp_transport_start";
+        status = pjsip_udp_transport_start(
+            endpoint->sip_endpoint,
+            &address,
+            NULL,
+            1,
+            &endpoint->transport
+        );
+        break;
+    case IP_PJSIP_TRANSPORT_TCP:
+        transport_operation = "pjsip_tcp_transport_start";
+        status = pjsip_tcp_transport_start(
+            endpoint->sip_endpoint,
+            &address,
+            1,
+            &endpoint->transport_factory
+        );
+        break;
+    case IP_PJSIP_TRANSPORT_TLS: {
+        transport_operation = "pjsip_tls_transport_start";
+        pjsip_tls_setting tls_settings;
+        pjsip_tls_setting_default(&tls_settings);
+        tls_settings.proto = PJ_SSL_SOCK_PROTO_TLS1_2 | PJ_SSL_SOCK_PROTO_TLS1_3;
+        tls_settings.verify_server = allow_self_signed_certificate ? PJ_FALSE : PJ_TRUE;
+        tls_settings.verify_client = PJ_FALSE;
+        tls_settings.require_client_cert = PJ_FALSE;
+        status = pjsip_tls_transport_start(
+            endpoint->sip_endpoint,
+            &tls_settings,
+            &address,
+            NULL,
+            1,
+            &endpoint->transport_factory
+        );
+        break;
+    }
+    default:
+        copy_error(error_buffer, error_buffer_length, "Unsupported SIP transport");
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
     if (status != PJ_SUCCESS) {
         copy_status_error(
             error_buffer,
             error_buffer_length,
-            "pjsip_udp_transport_start",
+            transport_operation,
             status
         );
         ip_pjsip_endpoint_stop(endpoint);
         return false;
     }
 
-    endpoint->bound_port = (uint16_t)endpoint->transport->local_name.port;
+    const pjsip_host_port *local = endpoint_local_name(endpoint);
+    endpoint->bound_port = local == NULL ? 0 : (uint16_t)local->port;
     endpoint->registration_state = IP_PJSIP_REGISTRATION_UNREGISTERED;
     endpoint->running = true;
     return true;
+}
+
+bool ip_pjsip_endpoint_start_udp(
+    IPPJSIPEndpoint *endpoint,
+    uint16_t port,
+    uint16_t rtp_port,
+    int audio_input_device,
+    int audio_output_device,
+    char *error_buffer,
+    int error_buffer_length
+) {
+    return ip_pjsip_endpoint_start(
+        endpoint,
+        IP_PJSIP_TRANSPORT_UDP,
+        port,
+        rtp_port,
+        audio_input_device,
+        audio_output_device,
+        true,
+        error_buffer,
+        error_buffer_length
+    );
 }
 
 uint16_t ip_pjsip_endpoint_bound_port(const IPPJSIPEndpoint *endpoint) {
@@ -782,16 +874,24 @@ bool ip_pjsip_endpoint_register(
     }
 
     char contact_buffer[PJSIP_MAX_URL_SIZE];
-    const pjsip_host_port *local = &endpoint->transport->local_name;
+    const pjsip_host_port *local = endpoint_local_name(endpoint);
+    if (local == NULL) {
+        copy_error(error_buffer, error_buffer_length, "SIP transport has no local address");
+        pjsip_regc_destroy(endpoint->registration_client);
+        endpoint->registration_client = NULL;
+        return false;
+    }
     const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
+    const char *transport_name = endpoint_transport_name(endpoint);
     snprintf(
         contact_buffer,
         sizeof(contact_buffer),
-        ipv6 ? "<sip:%s@[%.*s]:%d;transport=udp>" : "<sip:%s@%.*s:%d;transport=udp>",
+        ipv6 ? "<sip:%s@[%.*s]:%d;transport=%s>" : "<sip:%s@%.*s:%d;transport=%s>",
         user_id,
         (int)local->host.slen,
         local->host.ptr,
-        local->port
+        local->port,
+        transport_name
     );
 
     pj_str_t registrar = pj_str((char *)registrar_uri);
@@ -921,17 +1021,23 @@ bool ip_pjsip_endpoint_make_call(
         return false;
     }
 
-    const pjsip_host_port *local = &endpoint->transport->local_name;
+    const pjsip_host_port *local = endpoint_local_name(endpoint);
+    if (local == NULL) {
+        copy_error(error_buffer, error_buffer_length, "SIP transport has no local address");
+        return false;
+    }
     const bool ipv6 = memchr(local->host.ptr, ':', (size_t)local->host.slen) != NULL;
+    const char *transport_name = endpoint_transport_name(endpoint);
     char contact_buffer[PJSIP_MAX_URL_SIZE];
     snprintf(
         contact_buffer,
         sizeof(contact_buffer),
-        ipv6 ? "<sip:%s@[%.*s]:%d;transport=udp>" : "<sip:%s@%.*s:%d;transport=udp>",
+        ipv6 ? "<sip:%s@[%.*s]:%d;transport=%s>" : "<sip:%s@%.*s:%d;transport=%s>",
         user_id,
         (int)local->host.slen,
         local->host.ptr,
-        local->port
+        local->port,
+        transport_name
     );
     pj_str_t local_uri_string = pj_str((char *)local_uri);
     pj_str_t contact = pj_str(contact_buffer);
@@ -1234,6 +1340,7 @@ void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint) {
     endpoint->pj_initialized = false;
     endpoint->running = false;
     endpoint->transport = NULL;
+    endpoint->transport_factory = NULL;
     endpoint->bound_port = 0;
 }
 

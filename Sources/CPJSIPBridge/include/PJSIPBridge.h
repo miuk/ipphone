@@ -10,6 +10,12 @@ extern "C" {
 
 typedef struct IPPJSIPEndpoint IPPJSIPEndpoint;
 
+typedef enum IPPJSIPTransport {
+    IP_PJSIP_TRANSPORT_UDP = 0,
+    IP_PJSIP_TRANSPORT_TCP = 1,
+    IP_PJSIP_TRANSPORT_TLS = 2
+} IPPJSIPTransport;
+
 typedef enum IPPJSIPRegistrationState {
     IP_PJSIP_REGISTRATION_UNREGISTERED = 0,
     IP_PJSIP_REGISTRATION_REGISTERING = 1,
@@ -53,6 +59,20 @@ bool ip_pjsip_endpoint_start_udp(
     uint16_t rtp_port,
     int audio_input_device,
     int audio_output_device,
+    char *error_buffer,
+    int error_buffer_length
+);
+
+/// Initializes PJSIP and starts the selected SIP transport. TLS uses TLS
+/// 1.2/1.3 and verifies the server certificate unless explicitly disabled.
+bool ip_pjsip_endpoint_start(
+    IPPJSIPEndpoint *endpoint,
+    IPPJSIPTransport transport,
+    uint16_t port,
+    uint16_t rtp_port,
+    int audio_input_device,
+    int audio_output_device,
+    bool allow_self_signed_certificate,
     char *error_buffer,
     int error_buffer_length
 );

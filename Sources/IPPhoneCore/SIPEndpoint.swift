@@ -92,6 +92,7 @@ public final class SIPEndpoint: ObservableObject {
     @Published public private(set) var isMuted = false
     @Published public private(set) var rtpStatistics = RTPStatistics()
     @Published public private(set) var telephoneEventAvailable = false
+    @Published public private(set) var activeTransport: SIPTransport?
 
     public let pjsipVersion: String
 
@@ -110,6 +111,24 @@ public final class SIPEndpoint: ObservableObject {
         audioInputDevice: Int32 = -1,
         audioOutputDevice: Int32 = -1
     ) throws {
+        try start(
+            transport: .udp,
+            port: port,
+            rtpPort: rtpPort,
+            audioInputDevice: audioInputDevice,
+            audioOutputDevice: audioOutputDevice,
+            allowSelfSignedCertificate: true
+        )
+    }
+
+    public func start(
+        transport: SIPTransport,
+        port: UInt16 = 0,
+        rtpPort: UInt16 = 4_000,
+        audioInputDevice: Int32 = -1,
+        audioOutputDevice: Int32 = -1,
+        allowSelfSignedCertificate: Bool = true
+    ) throws {
         guard handle == nil else {
             return
         }
@@ -120,12 +139,19 @@ public final class SIPEndpoint: ObservableObject {
         }
 
         var errorBuffer = [CChar](repeating: 0, count: 512)
-        let started = ip_pjsip_endpoint_start_udp(
+        let bridgeTransport: IPPJSIPTransport = switch transport {
+        case .udp: IP_PJSIP_TRANSPORT_UDP
+        case .tcp: IP_PJSIP_TRANSPORT_TCP
+        case .tls: IP_PJSIP_TRANSPORT_TLS
+        }
+        let started = ip_pjsip_endpoint_start(
             newHandle,
+            bridgeTransport,
             port,
             rtpPort,
             audioInputDevice,
             audioOutputDevice,
+            allowSelfSignedCertificate,
             &errorBuffer,
             Int32(errorBuffer.count)
         )
@@ -142,15 +168,25 @@ public final class SIPEndpoint: ObservableObject {
         handle = PJSIPHandle(newHandle)
         let boundPort = ip_pjsip_endpoint_bound_port(newHandle)
         state = .running(localPort: boundPort)
-        logStore?.append(.info, category: "SIP", "UDP endpoint started on local port \(boundPort)")
+        activeTransport = transport
+        let certificatePolicy = transport == .tls
+            ? allowSelfSignedCertificate
+                ? ", server certificate verification disabled"
+                : ", server certificate verification enabled"
+            : ""
+        logStore?.append(
+            .info,
+            category: "SIP",
+            "\(transport.rawValue) endpoint started on local port \(boundPort)\(certificatePolicy)"
+        )
     }
 
     public func register(settings: SIPSettings, password: String) throws {
         guard let handle else {
             throw SIPEndpointError.registrationFailed("SIP endpoint is not running.")
         }
-        guard settings.transport == .udp else {
-            throw SIPEndpointError.registrationFailed("Only UDP REGISTER is available in this milestone.")
+        guard activeTransport == settings.transport else {
+            throw SIPEndpointError.registrationFailed("Stop and restart the endpoint after changing SIP transport.")
         }
         guard settings.validationIssues().isEmpty else {
             throw SIPEndpointError.registrationFailed("SIP settings are invalid.")
@@ -213,12 +249,15 @@ public final class SIPEndpoint: ObservableObject {
         guard let handle else {
             throw SIPEndpointError.callFailed("SIP endpoint is not running.")
         }
-        guard settings.transport == .udp, settings.validationIssues().isEmpty,
+        guard activeTransport == settings.transport else {
+            throw SIPEndpointError.callFailed("Stop and restart the endpoint after changing SIP transport.")
+        }
+        guard settings.validationIssues().isEmpty,
               let localURI = settings.addressOfRecord,
               let targetURI = settings.registrarURI,
               let rtpPort = UInt16(exactly: settings.rtpPortStart)
         else {
-            throw SIPEndpointError.callFailed("SIP settings are invalid or UDP is not selected.")
+            throw SIPEndpointError.callFailed("SIP settings are invalid.")
         }
         let destinationURI = try settings.destinationURI(for: destination)
         var errorBuffer = [CChar](repeating: 0, count: 512)
@@ -457,6 +496,7 @@ public final class SIPEndpoint: ObservableObject {
         isMuted = false
         rtpStatistics = RTPStatistics()
         telephoneEventAvailable = false
+        activeTransport = nil
         logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 
