@@ -17,5 +17,11 @@ swift test
 swift run IPPhoneApp
 ```
 
-現在はマイルストーン1として、PJSIP EndpointとUDPトランスポートの
-初期化・停止までを実装しています。
+マイルストーン2まで完了しています。
+
+- PJSIP EndpointとUDPトランスポートの初期化・停止
+- SIP、アカウント、メディア、TLS設定と入力検証
+- UserDefaultsおよびKeychainへの設定保存
+- OSLogとアプリ内ログ表示
+
+次のマイルストーンはUDPでのREGISTERです。

@@ -57,6 +57,7 @@ let package = Package(
                 .linkedFramework("AudioUnit"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("Foundation"),
+                .linkedFramework("Security"),
                 .linkedFramework("AppKit"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreGraphics"),

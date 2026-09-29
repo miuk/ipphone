@@ -42,9 +42,12 @@ public final class SIPEndpoint: ObservableObject {
     public let pjsipVersion: String
 
     private var handle: PJSIPHandle?
+    private weak var logStore: AppLogStore?
 
-    public init() {
+    public init(logStore: AppLogStore? = nil) {
+        self.logStore = logStore
         pjsipVersion = String(cString: ip_pjsip_version())
+        logStore?.append(.info, category: "SIP", "PJSIP \(pjsipVersion) loaded")
     }
 
     public func startUDP(port: UInt16 = 0) throws {
@@ -53,6 +56,7 @@ public final class SIPEndpoint: ObservableObject {
         }
         guard let newHandle = ip_pjsip_endpoint_create() else {
             state = .failed(message: SIPEndpointError.allocationFailed.localizedDescription)
+            logStore?.append(.error, category: "SIP", SIPEndpointError.allocationFailed.localizedDescription)
             throw SIPEndpointError.allocationFailed
         }
 
@@ -69,11 +73,14 @@ public final class SIPEndpoint: ObservableObject {
             let message = String(decoding: messageBytes, as: UTF8.self)
             ip_pjsip_endpoint_destroy(newHandle)
             state = .failed(message: message)
+            logStore?.append(.error, category: "SIP", message)
             throw SIPEndpointError.startupFailed(message)
         }
 
         handle = PJSIPHandle(newHandle)
-        state = .running(localPort: ip_pjsip_endpoint_bound_port(newHandle))
+        let boundPort = ip_pjsip_endpoint_bound_port(newHandle)
+        state = .running(localPort: boundPort)
+        logStore?.append(.info, category: "SIP", "UDP endpoint started on local port \(boundPort)")
     }
 
     public func stop() {
@@ -84,5 +91,6 @@ public final class SIPEndpoint: ObservableObject {
         ip_pjsip_endpoint_stop(handle.rawValue)
         self.handle = nil
         state = .stopped
+        logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 }
