@@ -12,6 +12,7 @@
 #include <pjsip/sip_transport_tcp.h>
 #include <pjsip/sip_transport_tls.h>
 #include <pjsip_ua.h>
+#include <CoreAudio/CoreAudio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +45,7 @@ struct IPPJSIPEndpoint {
     pjmedia_endpt *media_endpoint;
     pjmedia_event_mgr *media_event_manager;
     pjmedia_transport *media_transport;
+    bool media_transport_started;
     pjmedia_stream *media_stream;
     pjmedia_snd_port *sound_port;
     DTMFInjectPort *dtmf_inject_port;
@@ -271,6 +273,10 @@ static void destroy_media(IPPJSIPEndpoint *endpoint) {
         endpoint->tone_generator = NULL;
     }
     endpoint->dtmf_inject_port = NULL;
+    if (endpoint->media_transport_started) {
+        pjmedia_transport_media_stop(endpoint->media_transport);
+        endpoint->media_transport_started = false;
+    }
     if (endpoint->media_stream != NULL) {
         pjmedia_stream_destroy(endpoint->media_stream);
         endpoint->media_stream = NULL;
@@ -300,6 +306,41 @@ static void set_media_error(IPPJSIPEndpoint *endpoint, const char *operation, pj
         detail
     );
     endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
+}
+
+static bool default_audio_device(pj_bool_t capture, int *index, char *name, size_t name_size) {
+    AudioObjectPropertyAddress address = {
+        capture ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioDeviceID device_id = kAudioObjectUnknown;
+    UInt32 size = sizeof(device_id);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &device_id) != noErr ||
+        device_id == kAudioObjectUnknown) {
+        return false;
+    }
+
+    char device_name[PJMEDIA_AUD_DEV_INFO_NAME_LEN] = {0};
+    address.mSelector = kAudioDevicePropertyDeviceName;
+    size = sizeof(device_name);
+    if (AudioObjectGetPropertyData(device_id, &address, 0, NULL, &size, device_name) != noErr) {
+        return false;
+    }
+    device_name[sizeof(device_name) - 1] = '\0';
+
+    for (unsigned i = 0; i < pjmedia_aud_dev_count(); ++i) {
+        pjmedia_aud_dev_info info;
+        if (pjmedia_aud_dev_get_info((int)i, &info) == PJ_SUCCESS &&
+            strcmp(info.driver, "core audio") == 0 &&
+            strcmp(info.name, device_name) == 0 &&
+            (capture ? info.input_count : info.output_count) > 0) {
+            *index = (int)i;
+            snprintf(name, name_size, "%s", info.name);
+            return true;
+        }
+    }
+    return false;
 }
 
 static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
@@ -337,6 +378,20 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
         endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
         return;
     }
+    if (info.param == NULL) {
+        info.param = PJ_POOL_ZALLOC_T(endpoint->call_pool, pjmedia_codec_param);
+        status = pjmedia_codec_mgr_get_default_param(
+            pjmedia_endpt_get_codec_mgr(endpoint->media_endpoint),
+            &info.fmt,
+            info.param
+        );
+        if (status != PJ_SUCCESS) {
+            set_media_error(endpoint, "PCMU codec parameters", status);
+            return;
+        }
+    }
+    // Keep sending RTP during silence so the peer receives a continuous stream.
+    info.param->setting.vad = 0;
     endpoint->telephone_event_available = info.tx_event_pt >= 0;
 
     status = pjmedia_stream_create(
@@ -351,6 +406,18 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
         set_media_error(endpoint, "pjmedia_stream_create", status);
         return;
     }
+    status = pjmedia_transport_media_start(
+        endpoint->media_transport,
+        endpoint->call_pool,
+        local_sdp,
+        remote_sdp,
+        0
+    );
+    if (status != PJ_SUCCESS) {
+        set_media_error(endpoint, "pjmedia_transport_media_start", status);
+        return;
+    }
+    endpoint->media_transport_started = true;
     status = pjmedia_stream_start(endpoint->media_stream);
     if (status != PJ_SUCCESS) {
         set_media_error(endpoint, "pjmedia_stream_start", status);
@@ -364,6 +431,35 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
     }
     endpoint->audio_initialized = true;
 
+    int input_device = endpoint->audio_input_device;
+    int output_device = endpoint->audio_output_device;
+    char input_name[PJMEDIA_AUD_DEV_INFO_NAME_LEN] = {0};
+    char output_name[PJMEDIA_AUD_DEV_INFO_NAME_LEN] = {0};
+    if (input_device < 0 || output_device < 0) {
+        status = pjmedia_aud_dev_refresh();
+        if (status != PJ_SUCCESS) {
+            set_media_error(endpoint, "Audio device refresh", status);
+            return;
+        }
+    }
+    if (input_device < 0 && !default_audio_device(PJ_TRUE, &input_device, input_name, sizeof(input_name))) {
+        snprintf(endpoint->media_message, sizeof(endpoint->media_message), "Could not find the macOS default input device");
+        endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
+        return;
+    }
+    if (output_device < 0 && !default_audio_device(PJ_FALSE, &output_device, output_name, sizeof(output_name))) {
+        snprintf(endpoint->media_message, sizeof(endpoint->media_message), "Could not find the macOS default output device");
+        endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
+        return;
+    }
+    pjmedia_aud_dev_info device_info;
+    if (pjmedia_aud_dev_get_info(input_device, &device_info) == PJ_SUCCESS) {
+        snprintf(input_name, sizeof(input_name), "%s", device_info.name);
+    }
+    if (pjmedia_aud_dev_get_info(output_device, &device_info) == PJ_SUCCESS) {
+        snprintf(output_name, sizeof(output_name), "%s", device_info.name);
+    }
+
     pjmedia_port *stream_port = NULL;
     status = pjmedia_stream_get_port(endpoint->media_stream, &stream_port);
     if (status == PJ_SUCCESS) {
@@ -372,8 +468,8 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
     if (status == PJ_SUCCESS) {
         status = pjmedia_snd_port_create(
             endpoint->call_pool,
-            endpoint->audio_input_device,
-            endpoint->audio_output_device,
+            input_device,
+            output_device,
             8000,
             1,
             160,
@@ -391,7 +487,10 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
     }
 
     endpoint->media_state = IP_PJSIP_MEDIA_ACTIVE;
-    snprintf(endpoint->media_message, sizeof(endpoint->media_message), "PCMU 8000 Hz send/receive active");
+    snprintf(endpoint->media_message, sizeof(endpoint->media_message),
+             "PCMU 8000 Hz send/receive active (input: %s, output: %s)",
+             input_name[0] ? input_name : "unknown",
+             output_name[0] ? output_name : "unknown");
 }
 
 static pjmedia_sdp_session *create_audio_sdp(
@@ -422,7 +521,7 @@ static pjmedia_sdp_session *create_audio_sdp(
                 endpoint->media_endpoint,
                 address_family,
                 "ipphone-rtp",
-                NULL,
+                &local->host,
                 rtp_port,
                 0,
                 &endpoint->media_transport

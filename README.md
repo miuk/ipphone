@@ -17,6 +17,14 @@ swift test
 swift run IPPhoneApp
 ```
 
+デバッグ用の `.build/debug/IPPhoneApp` にもマイク利用理由を埋め込んでいます。
+ローカルIPが「Automatic」の場合は、SIPサーバーへの経路で使うIPを
+SIPヘッダーとSDPに通知し、RTPソケットもそのIPにバインドします。
+初回通話時に macOS のマイク許可を求められたら許可してください。通話中は
+「Media」が `PCMU/8000 send/receive` となり、「RTP」の TX 件数が
+無音中も増えることを確認できます。Media に失敗が表示された場合は、
+その内容と通話相手の SDP を確認してください。
+
 ## ローカル配布用ビルド
 
 ```bash

@@ -94,6 +94,7 @@ public final class SIPEndpoint: ObservableObject {
     @Published public private(set) var telephoneEventAvailable = false
     @Published public private(set) var activeTransport: SIPTransport?
     @Published public private(set) var activeLocalIPAddress: String?
+    @Published public private(set) var boundLocalIPAddress: String?
 
     public let pjsipVersion: String
 
@@ -110,7 +111,7 @@ public final class SIPEndpoint: ObservableObject {
         port: UInt16 = 0,
         rtpPort: UInt16 = 4_000,
         audioInputDevice: Int32 = -1,
-        audioOutputDevice: Int32 = -1,
+        audioOutputDevice: Int32 = -2,
         localIPAddress: String? = nil
     ) throws {
         try start(
@@ -129,9 +130,11 @@ public final class SIPEndpoint: ObservableObject {
         port: UInt16 = 0,
         rtpPort: UInt16 = 4_000,
         audioInputDevice: Int32 = -1,
-        audioOutputDevice: Int32 = -1,
+        audioOutputDevice: Int32 = -2,
         allowSelfSignedCertificate: Bool = true,
-        localIPAddress: String? = nil
+        localIPAddress: String? = nil,
+        serverHost: String? = nil,
+        serverPort: UInt16 = 5060
     ) throws {
         guard handle == nil else {
             guard activeTransport == transport, activeLocalIPAddress == localIPAddress else {
@@ -146,6 +149,11 @@ public final class SIPEndpoint: ObservableObject {
             guard try LocalIPAddress.available().contains(where: { $0.address == localIPAddress }) else {
                 throw SIPEndpointError.startupFailed("The selected local SIP IP address is unavailable. Select an available address in Settings.")
             }
+        }
+        let selectedAddress = localIPAddress
+            ?? serverHost.flatMap { LocalIPAddress.routedSourceAddress(to: $0, port: serverPort) }
+        if serverHost != nil && selectedAddress == nil {
+            logStore?.append(.warning, category: "SIP", "Could not determine the route to the SIP server; using automatic local IP")
         }
         guard let newHandle = ip_pjsip_endpoint_create() else {
             state = .failed(message: SIPEndpointError.allocationFailed.localizedDescription)
@@ -173,7 +181,7 @@ public final class SIPEndpoint: ObservableObject {
                 Int32(errorBuffer.count)
             )
         }
-        let started = localIPAddress.map { $0.withCString(startBridge) } ?? startBridge(nil)
+        let started = selectedAddress.map { $0.withCString(startBridge) } ?? startBridge(nil)
 
         guard started else {
             let messageBytes = errorBuffer.prefix { $0 != 0 }.map(UInt8.init(bitPattern:))
@@ -189,6 +197,7 @@ public final class SIPEndpoint: ObservableObject {
         state = .running(localPort: boundPort)
         activeTransport = transport
         activeLocalIPAddress = localIPAddress
+        boundLocalIPAddress = selectedAddress
         let certificatePolicy = transport == .tls
             ? allowSelfSignedCertificate
                 ? ", server certificate verification disabled"
@@ -197,7 +206,7 @@ public final class SIPEndpoint: ObservableObject {
         logStore?.append(
             .info,
             category: "SIP",
-            "\(transport.rawValue) endpoint started on local port \(boundPort), local IP \(localIPAddress ?? "automatic")\(certificatePolicy)"
+            "\(transport.rawValue) endpoint started on local port \(boundPort), local IP \(selectedAddress ?? "automatic")\(certificatePolicy)"
         )
     }
 
@@ -460,7 +469,7 @@ public final class SIPEndpoint: ObservableObject {
             mediaState = newState
             switch newState {
             case let .active(codec):
-                logStore?.append(.info, category: "Media", "Audio active: \(codec)")
+                logStore?.append(.info, category: "Media", message.isEmpty ? "Audio active: \(codec)" : message)
             case let .failed(message):
                 logStore?.append(.error, category: "Media", message)
             case .idle, .starting:
@@ -533,6 +542,7 @@ public final class SIPEndpoint: ObservableObject {
         telephoneEventAvailable = false
         activeTransport = nil
         activeLocalIPAddress = nil
+        boundLocalIPAddress = nil
         logStore?.append(.info, category: "SIP", "Endpoint stopped")
     }
 

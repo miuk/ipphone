@@ -91,7 +91,7 @@ private struct PhoneView: View {
             Text("IP Phone Test Client").font(.largeTitle)
             LabeledContent("PJSIP", value: endpoint.pjsipVersion)
             LabeledContent("Endpoint", value: stateDescription)
-            LabeledContent("Local SIP IP", value: endpoint.activeLocalIPAddress ?? "Automatic")
+            LabeledContent("Local SIP IP", value: endpoint.boundLocalIPAddress ?? "Automatic")
             if isRunning && !transportMatches {
                 Label("Stop and restart the endpoint to apply the transport or local IP change.", systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
@@ -337,9 +337,11 @@ private struct PhoneView: View {
             port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0,
             rtpPort: UInt16(exactly: settingsStore.settings.rtpPortStart) ?? 4_000,
             audioInputDevice: Int32(exactly: settingsStore.settings.audioInputDeviceIndex ?? -1) ?? -1,
-            audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -1) ?? -1,
+            audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -2) ?? -2,
             allowSelfSignedCertificate: settingsStore.settings.allowSelfSignedCertificate,
-            localIPAddress: settingsStore.settings.localIPAddress
+            localIPAddress: settingsStore.settings.localIPAddress,
+            serverHost: settingsStore.settings.serverHost,
+            serverPort: UInt16(exactly: settingsStore.settings.serverPort) ?? 5060
         )
     }
 }
@@ -372,7 +374,7 @@ private struct SettingsView: View {
                     }
                 }
                 Button("Refresh local IP addresses") { refreshLocalAddresses() }
-                Text("Used for Via, Contact and SDP. Stop and restart the endpoint after changing this setting. IPv6 link-local addresses are excluded.")
+                Text("Automatic uses the route to the SIP server for Via, Contact, SDP and RTP. Stop and restart the endpoint after changing this setting. IPv6 link-local addresses are excluded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let addressError {

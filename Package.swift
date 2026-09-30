@@ -75,7 +75,15 @@ let package = Package(
         ),
         .executableTarget(
             name: "IPPhoneApp",
-            dependencies: ["IPPhoneCore"]
+            dependencies: ["IPPhoneCore"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Distribution/Info.plist",
+                ]),
+            ]
         ),
         .testTarget(
             name: "IPPhoneCoreTests",

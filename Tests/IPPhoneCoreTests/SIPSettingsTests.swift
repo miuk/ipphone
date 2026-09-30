@@ -97,6 +97,11 @@ struct SIPSettingsTests {
         #expect(addresses.allSatisfy { !$0.interfaceName.isEmpty && LocalIPAddress.isValid($0.address) })
         #expect(Set(addresses.map(\.id)).count == addresses.count)
     }
+
+    @Test
+    func selectsLoopbackSourceForLoopbackServer() {
+        #expect(LocalIPAddress.routedSourceAddress(to: "127.0.0.1", port: 5060) == "127.0.0.1")
+    }
 }
 
 @MainActor

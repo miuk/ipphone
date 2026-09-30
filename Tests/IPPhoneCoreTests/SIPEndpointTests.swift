@@ -71,6 +71,31 @@ struct SIPEndpointTests {
         #expect(!logs.exportedText.localizedCaseInsensitiveContains("Authorization:"))
     }
 
+    @Test
+    func advertisesRoutedAddressInOutgoingSDP() throws {
+        let receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(receiver >= 0)
+        defer { close(receiver) }
+        let serverPort = try bindLoopbackSocket(receiver, family: AF_INET)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        try #require(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                               socklen_t(MemoryLayout<timeval>.size)) == 0)
+
+        let endpoint = SIPEndpoint()
+        try endpoint.start(transport: .udp, serverHost: "127.0.0.1", serverPort: UInt16(serverPort))
+        defer { endpoint.stop() }
+        #expect(endpoint.boundLocalIPAddress == "127.0.0.1")
+        let settings = SIPSettings(
+            serverHost: "127.0.0.1",
+            serverPort: serverPort,
+            userID: "1001",
+            phoneNumber: "1001"
+        )
+        try endpoint.makeCall(destination: "1002", settings: settings, password: "test-password")
+        let invite = try receiveMessage(descriptor: receiver)
+        #expect(invite.contains("\r\nc=IN IP4 127.0.0.1\r\n"))
+    }
+
     @Test(arguments: [nil, "127.0.0.1"] as [String?])
     func enclosesOutgoingFromAndToURIs(localIPAddress: String?) throws {
         let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -408,15 +433,20 @@ struct SIPEndpointTests {
 
     @Test
     func receivesAndAnswersIncomingInvite() throws {
+        let rtpReceiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(rtpReceiver >= 0)
+        defer { close(rtpReceiver) }
+        let remoteRTPPort = try bindLoopbackSocket(rtpReceiver, family: AF_INET)
+
         let endpoint = SIPEndpoint()
-        try endpoint.startUDP(port: 0)
+        try endpoint.start(transport: .udp, port: 0, serverHost: "127.0.0.1")
         defer { endpoint.stop() }
         guard case let .running(port) = endpoint.state else {
             Issue.record("Endpoint did not start")
             return
         }
 
-        try sendInvite(to: port)
+        try sendInvite(to: port, mediaPort: remoteRTPPort)
         for _ in 0..<20 {
             endpoint.poll()
             if case .incoming = endpoint.callState { break }
@@ -437,6 +467,23 @@ struct SIPEndpointTests {
             Issue.record("PCMU media did not become active")
             return
         }
+        var receivedRTP = false
+        var packet = [UInt8](repeating: 0, count: 2048)
+        for _ in 0..<100 {
+            let size = packet.withUnsafeMutableBytes { recv(rtpReceiver, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+            if size >= 12, packet[0] >> 6 == 2, packet[1] & 0x7f == 0 {
+                receivedRTP = true
+                break
+            }
+            usleep(10_000)
+        }
+        #expect(receivedRTP)
+        usleep(900_000)
+        endpoint.poll()
+        let packetsBeforeSilence = endpoint.rtpStatistics.transmittedPackets
+        usleep(250_000)
+        endpoint.poll()
+        #expect(endpoint.rtpStatistics.transmittedPackets > packetsBeforeSilence)
         endpoint.setMuted(true)
         #expect(endpoint.isMuted)
         endpoint.setMuted(false)
@@ -476,6 +523,7 @@ struct SIPEndpointTests {
 
     private func sendInvite(
         to port: UInt16,
+        mediaPort: Int = 5000,
         supportsTelephoneEvent: Bool = false,
         senderDescriptor: Int32? = nil,
         bareURIs: Bool = false,
@@ -495,7 +543,7 @@ struct SIPEndpointTests {
         s=Test\r
         c=IN IP4 127.0.0.1\r
         t=0 0\r
-        m=audio 5000 RTP/AVP 0\(eventPayload)\r
+        m=audio \(mediaPort) RTP/AVP 0\(eventPayload)\r
         a=rtpmap:0 PCMU/8000\r
         \(eventAttributes)
 

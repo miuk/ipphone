@@ -45,6 +45,52 @@ public struct LocalIPAddress: Equatable, Identifiable, Sendable {
         }
     }
 
+    /// Returns the source address the OS would use to reach a SIP server.
+    /// Connecting a UDP socket selects a route without sending a packet.
+    public static func routedSourceAddress(to host: String, port: UInt16) -> String? {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_DGRAM
+        hints.ai_protocol = IPPROTO_UDP
+        var resolved: UnsafeMutablePointer<addrinfo>?
+        let result = host.withCString { name in
+            String(port).withCString { service in
+                getaddrinfo(name, service, &hints, &resolved)
+            }
+        }
+        guard result == 0 else { return nil }
+        defer { freeaddrinfo(resolved) }
+
+        var current = resolved
+        while let candidate = current {
+            defer { current = candidate.pointee.ai_next }
+            let descriptor = socket(candidate.pointee.ai_family, SOCK_DGRAM, IPPROTO_UDP)
+            guard descriptor >= 0 else { continue }
+            defer { close(descriptor) }
+            guard connect(descriptor, candidate.pointee.ai_addr, candidate.pointee.ai_addrlen) == 0 else {
+                continue
+            }
+            var address = sockaddr_storage()
+            var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let named = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getsockname(descriptor, $0, &length)
+                }
+            }
+            guard named == 0 else { continue }
+            var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let readable = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getnameinfo($0, length, &hostBuffer, socklen_t(hostBuffer.count), nil, 0, NI_NUMERICHOST)
+                }
+            }
+            guard readable == 0 else { continue }
+            let addressText = String(decoding: hostBuffer.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
+            if isValid(addressText) { return addressText }
+        }
+        return nil
+    }
+
     public static func isValid(_ address: String) -> Bool {
         guard !address.utf8.contains(0) else { return false }
         var ipv4 = in_addr()
