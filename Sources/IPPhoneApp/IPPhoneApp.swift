@@ -39,13 +39,15 @@ private final class IPPhoneAppDelegate: NSObject, NSApplicationDelegate {
 
 private enum AppSection: String, CaseIterable, Identifiable {
     case phone = "Phone"
+    case calls = "Calls"
     case settings = "Settings"
     case logs = "Logs"
 
     var id: Self { self }
     var icon: String {
         switch self {
-        case .phone: "phone"
+        case .phone: "network"
+        case .calls: "phone"
         case .settings: "gearshape"
         case .logs: "text.alignleft"
         }
@@ -57,6 +59,8 @@ private struct ContentView: View {
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logStore: AppLogStore
     @State private var selection: AppSection? = .phone
+    @State private var destination = ""
+    @State private var dtmfStatus = ""
     private let pollTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -69,6 +73,14 @@ private struct ContentView: View {
             switch selection ?? .phone {
             case .phone:
                 PhoneView(endpoint: endpoint, settingsStore: settingsStore, logs: logStore)
+            case .calls:
+                CallView(
+                    endpoint: endpoint,
+                    settingsStore: settingsStore,
+                    logs: logStore,
+                    destination: $destination,
+                    dtmfStatus: $dtmfStatus
+                )
             case .settings:
                 SettingsView(store: settingsStore, logs: logStore)
             case .logs:
@@ -83,8 +95,6 @@ private struct PhoneView: View {
     @ObservedObject var endpoint: SIPEndpoint
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logs: AppLogStore
-    @State private var destination = ""
-    @State private var dtmfStatus = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -99,8 +109,6 @@ private struct PhoneView: View {
             LabeledContent("Server", value: serverDescription)
             LabeledContent("Address of Record", value: settingsStore.settings.addressOfRecord ?? "Not configured")
             LabeledContent("Registration", value: registrationDescription)
-            LabeledContent("Call", value: callDescription)
-            LabeledContent("Media", value: mediaDescription)
 
             HStack {
                 Button("Start \(settingsStore.settings.transport.rawValue) endpoint") {
@@ -115,57 +123,6 @@ private struct PhoneView: View {
                     .keyboardShortcut("r", modifiers: .command)
                 Button("Unregister") { unregister() }
                     .disabled(!canUnregister)
-            }
-            Divider()
-            TextField("Destination number or SIP URI", text: $destination)
-                .textFieldStyle(.roundedBorder)
-                .disabled(hasActiveCall)
-                .onSubmit { makeCall() }
-            HStack {
-                Button("Call") { makeCall() }
-                    .disabled(!canMakeCall)
-                    .keyboardShortcut(.return, modifiers: [])
-                if isIncoming {
-                    Button("Answer") { answerCall() }
-                        .buttonStyle(.borderedProminent)
-                    Button("Reject") { endCall(statusCode: 486) }
-                } else {
-                    Button("Hang Up") { endCall() }.disabled(!hasActiveCall)
-                }
-                Button(endpoint.isMuted ? "Unmute" : "Mute") {
-                    endpoint.setMuted(!endpoint.isMuted)
-                }
-                .disabled(!isMediaActive)
-            }
-            if isMediaActive {
-                LabeledContent(
-                    "RTP",
-                    value: "TX \(endpoint.rtpStatistics.transmittedPackets) / RX \(endpoint.rtpStatistics.receivedPackets) / Lost \(endpoint.rtpStatistics.lostPackets) / Jitter \(endpoint.rtpStatistics.jitterMicroseconds) μs"
-                )
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("DTMF").font(.headline)
-                        Text(dtmfCapabilityDescription).foregroundStyle(.secondary)
-                    }
-                    Grid(horizontalSpacing: 8, verticalSpacing: 8) {
-                        ForEach([["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["*", "0", "#"]], id: \.self) { row in
-                            GridRow {
-                                ForEach(row, id: \.self) { digit in
-                                    Button(digit) { sendDTMF(digit) }
-                                        .frame(minWidth: 48)
-                                        .buttonStyle(.bordered)
-                                }
-                            }
-                        }
-                    }
-                    if !dtmfStatus.isEmpty {
-                        Text(dtmfStatus).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
-            if isIncoming {
-                Label("Incoming call", systemImage: "phone.arrow.down.left")
-                    .font(.title2).foregroundStyle(.orange)
             }
             Spacer()
         }
@@ -211,6 +168,117 @@ private struct PhoneView: View {
 
     private var canUnregister: Bool {
         if case .registered = endpoint.registrationState { true } else { false }
+    }
+
+    private var isRegistered: Bool {
+        if case .registered = endpoint.registrationState { true } else { false }
+    }
+
+    private var transportMatches: Bool {
+        !isRunning || (endpoint.activeTransport == settingsStore.settings.transport
+            && endpoint.activeLocalIPAddress == settingsStore.settings.localIPAddress)
+    }
+
+    private func startEndpoint() {
+        do {
+            try endpoint.start(settings: settingsStore.settings)
+        } catch {
+            logs.append(.error, category: "SIP", error.localizedDescription)
+        }
+    }
+
+    private func register() {
+        do {
+            if !isRunning { try endpoint.start(settings: settingsStore.settings) }
+            try endpoint.register(settings: settingsStore.settings, password: settingsStore.password)
+        } catch {
+            logs.append(.error, category: "REGISTER", error.localizedDescription)
+        }
+    }
+
+    private func unregister() {
+        do { try endpoint.unregister() }
+        catch { logs.append(.error, category: "REGISTER", error.localizedDescription) }
+    }
+}
+
+private struct CallView: View {
+    @ObservedObject var endpoint: SIPEndpoint
+    @ObservedObject var settingsStore: SettingsStore
+    @ObservedObject var logs: AppLogStore
+    @Binding var destination: String
+    @Binding var dtmfStatus: String
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                Text("Calls").font(.largeTitle)
+                LabeledContent("Call", value: callDescription)
+                LabeledContent("Media", value: mediaDescription)
+                if isRunning && !transportMatches {
+                    Label("Stop and restart the endpoint in Phone to apply the transport or local IP change.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+                Divider()
+                TextField("Destination number or SIP URI", text: $destination)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(hasActiveCall)
+                    .onSubmit { makeCall() }
+                HStack {
+                    Button("Call") { makeCall() }
+                        .disabled(!canMakeCall)
+                        .keyboardShortcut(.return, modifiers: [])
+                    if isIncoming {
+                        Button("Answer") { answerCall() }
+                            .buttonStyle(.borderedProminent)
+                        Button("Reject") { endCall(statusCode: 486) }
+                    } else {
+                        Button("Hang Up") { endCall() }.disabled(!hasActiveCall)
+                    }
+                    Button(endpoint.isMuted ? "Unmute" : "Mute") {
+                        endpoint.setMuted(!endpoint.isMuted)
+                    }
+                    .disabled(!isMediaActive)
+                }
+                if isMediaActive {
+                    LabeledContent(
+                        "RTP",
+                        value: "TX \(endpoint.rtpStatistics.transmittedPackets) / RX \(endpoint.rtpStatistics.receivedPackets) / Lost \(endpoint.rtpStatistics.lostPackets) / Jitter \(endpoint.rtpStatistics.jitterMicroseconds) μs"
+                    )
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("DTMF").font(.headline)
+                            Text(dtmfCapabilityDescription).foregroundStyle(.secondary)
+                        }
+                        Grid(horizontalSpacing: 8, verticalSpacing: 8) {
+                            ForEach([["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["*", "0", "#"]], id: \.self) { row in
+                                GridRow {
+                                    ForEach(row, id: \.self) { digit in
+                                        Button(digit) { sendDTMF(digit) }
+                                            .frame(minWidth: 48)
+                                            .buttonStyle(.bordered)
+                                    }
+                                }
+                            }
+                        }
+                        if !dtmfStatus.isEmpty {
+                            Text(dtmfStatus).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if isIncoming {
+                    Label("Incoming call", systemImage: "phone.arrow.down.left")
+                        .font(.title2).foregroundStyle(.orange)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(28)
+        }
+        .navigationTitle("Calls")
+    }
+
+    private var isRunning: Bool {
+        if case .running = endpoint.state { true } else { false }
     }
 
     private var callDescription: String {
@@ -265,40 +333,14 @@ private struct PhoneView: View {
         if case .incoming = endpoint.callState { true } else { false }
     }
 
-    private var isRegistered: Bool {
-        if case .registered = endpoint.registrationState { true } else { false }
-    }
-
     private var transportMatches: Bool {
         !isRunning || (endpoint.activeTransport == settingsStore.settings.transport
             && endpoint.activeLocalIPAddress == settingsStore.settings.localIPAddress)
     }
 
-    private func startEndpoint() {
-        do {
-            try startEndpointForCurrentSettings()
-        } catch {
-            logs.append(.error, category: "SIP", error.localizedDescription)
-        }
-    }
-
-    private func register() {
-        do {
-            if !isRunning { try startEndpointForCurrentSettings() }
-            try endpoint.register(settings: settingsStore.settings, password: settingsStore.password)
-        } catch {
-            logs.append(.error, category: "REGISTER", error.localizedDescription)
-        }
-    }
-
-    private func unregister() {
-        do { try endpoint.unregister() }
-        catch { logs.append(.error, category: "REGISTER", error.localizedDescription) }
-    }
-
     private func makeCall() {
         do {
-            if !isRunning { try startEndpointForCurrentSettings() }
+            if !isRunning { try endpoint.start(settings: settingsStore.settings) }
             try endpoint.makeCall(
                 destination: destination,
                 settings: settingsStore.settings,
@@ -330,18 +372,20 @@ private struct PhoneView: View {
             dtmfStatus = error.localizedDescription
         }
     }
+}
 
-    private func startEndpointForCurrentSettings() throws {
-        try endpoint.start(
-            transport: settingsStore.settings.transport,
-            port: UInt16(exactly: settingsStore.settings.localSIPPort) ?? 0,
-            rtpPort: UInt16(exactly: settingsStore.settings.rtpPortStart) ?? 4_000,
-            audioInputDevice: Int32(exactly: settingsStore.settings.audioInputDeviceIndex ?? -1) ?? -1,
-            audioOutputDevice: Int32(exactly: settingsStore.settings.audioOutputDeviceIndex ?? -2) ?? -2,
-            allowSelfSignedCertificate: settingsStore.settings.allowSelfSignedCertificate,
-            localIPAddress: settingsStore.settings.localIPAddress,
-            serverHost: settingsStore.settings.serverHost,
-            serverPort: UInt16(exactly: settingsStore.settings.serverPort) ?? 5060
+private extension SIPEndpoint {
+    func start(settings: SIPSettings) throws {
+        try start(
+            transport: settings.transport,
+            port: UInt16(exactly: settings.localSIPPort) ?? 0,
+            rtpPort: UInt16(exactly: settings.rtpPortStart) ?? 4_000,
+            audioInputDevice: Int32(exactly: settings.audioInputDeviceIndex ?? -1) ?? -1,
+            audioOutputDevice: Int32(exactly: settings.audioOutputDeviceIndex ?? -2) ?? -2,
+            allowSelfSignedCertificate: settings.allowSelfSignedCertificate,
+            localIPAddress: settings.localIPAddress,
+            serverHost: settings.serverHost,
+            serverPort: UInt16(exactly: settings.serverPort) ?? 5060
         )
     }
 }
