@@ -295,6 +295,8 @@ public final class SIPEndpoint: ObservableObject {
             throw SIPEndpointError.callFailed("SIP settings are invalid.")
         }
         let destinationURI = try settings.destinationURI(for: destination)
+        let trimmedDestination = destination.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let usesExplicitURI = trimmedDestination.hasPrefix("sip:") || trimmedDestination.hasPrefix("sips:")
         var errorBuffer = [CChar](repeating: 0, count: 512)
         let started = localURI.withCString { localURI in
             destinationURI.withCString { destinationURI in
@@ -306,6 +308,7 @@ public final class SIPEndpoint: ObservableObject {
                                 localURI,
                                 destinationURI,
                                 targetURI,
+                                usesExplicitURI,
                                 userID,
                                 password,
                                 rtpPort,

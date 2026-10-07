@@ -1250,6 +1250,7 @@ bool ip_pjsip_endpoint_make_call(
     const char *local_uri,
     const char *destination_uri,
     const char *target_uri,
+    bool uses_explicit_uri,
     const char *user_id,
     const char *password,
     uint16_t rtp_port,
@@ -1284,7 +1285,7 @@ bool ip_pjsip_endpoint_make_call(
     pj_str_t local_uri_string = pj_str((char *)local_uri);
     pj_str_t contact = pj_str(contact_buffer);
     pj_str_t remote_uri = pj_str((char *)destination_uri);
-    pj_str_t target = pj_str((char *)target_uri);
+    pj_str_t target = pj_str((char *)(uses_explicit_uri ? destination_uri : target_uri));
     pjsip_dialog *dialog = NULL;
     pj_status_t status = pjsip_dlg_create_uac(
         pjsip_ua_instance(),
@@ -1299,11 +1300,26 @@ bool ip_pjsip_endpoint_make_call(
         return false;
     }
 
-    // Address the called party at the configured SIP server. The remote
-    // identity supplies the user, while the target retains server routing.
-    pjsip_sip_uri *remote_sip_uri = pjsip_uri_get_uri(dialog->remote.info->uri);
-    pjsip_sip_uri *target_sip_uri = pjsip_uri_get_uri(dialog->target);
-    pj_strdup(dialog->pool, &target_sip_uri->user, &remote_sip_uri->user);
+    if (uses_explicit_uri) {
+        // Preserve an explicitly supplied port when serializing To headers.
+        pjsip_cfg()->endpt.allow_port_in_fromto_hdr = PJ_TRUE;
+        // Keep the full Request-URI independent from the To identity, whose
+        // URI parameters must be removed (including unknown extensions).
+        dialog->remote.info->uri = pjsip_uri_clone(dialog->pool, dialog->remote.info->uri);
+        pjsip_sip_uri *to_uri = pjsip_uri_get_uri(dialog->remote.info->uri);
+        to_uri->user_param = pj_str("");
+        to_uri->method_param = pj_str("");
+        to_uri->transport_param = pj_str("");
+        to_uri->ttl_param = -1;
+        to_uri->lr_param = 0;
+        to_uri->maddr_param = pj_str("");
+        pj_list_init(&to_uri->other_param);
+    } else {
+        // Number destinations use the configured SIP server for routing.
+        pjsip_sip_uri *remote_sip_uri = pjsip_uri_get_uri(dialog->remote.info->uri);
+        pjsip_sip_uri *target_sip_uri = pjsip_uri_get_uri(dialog->target);
+        pj_strdup(dialog->pool, &target_sip_uri->user, &remote_sip_uri->user);
+    }
 
     pjsip_cred_info credential;
     pj_bzero(&credential, sizeof(credential));

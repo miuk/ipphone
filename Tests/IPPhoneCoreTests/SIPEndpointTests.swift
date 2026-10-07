@@ -170,6 +170,36 @@ struct SIPEndpointTests {
         #expect(response.contains("\r\nTo: <sip:1001@127.0.0.1>;tag="))
     }
 
+    @Test(arguments: ["", ";user=phone;transport=udp;ttl=3;maddr=127.0.0.1;lr;x-test=value"],
+          ["2002", "2002;extension"])
+    func usesExplicitRequestURIAndRemovesToURIParameters(parameters: String, user: String) throws {
+        let receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(receiver >= 0)
+        defer { close(receiver) }
+        let port = try bindLoopbackSocket(receiver, family: AF_INET)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        try #require(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                               socklen_t(MemoryLayout<timeval>.size)) == 0)
+
+        let endpoint = SIPEndpoint()
+        try endpoint.startUDP(port: 0)
+        defer { endpoint.stop() }
+        let settings = SIPSettings(
+            serverHost: "127.0.0.1",
+            serverPort: 9,
+            userID: "1001",
+            phoneNumber: "1001",
+            sipDomain: "example.test"
+        )
+        let address = "sip:\(user)@127.0.0.1:\(port)"
+        let destination = address + parameters
+        try endpoint.makeCall(destination: destination, settings: settings, password: "test-password")
+        let invite = try receiveMessage(descriptor: receiver)
+        #expect(invite.hasPrefix("INVITE \(destination) SIP/2.0\r\n"))
+        #expect(invite.contains("\r\nTo: <\(address)>\r\n"))
+        #expect(invite.contains("\r\nFrom: <sip:1001@example.test>;tag="))
+    }
+
     private func receiveMessage(descriptor: Int32) throws -> String {
         var buffer = [UInt8](repeating: 0, count: 8192)
         let received = buffer.withUnsafeMutableBytes {

@@ -20,12 +20,12 @@ struct SIPSettingsTests {
         )
     }
 
-    @Test
-    func preservesCompleteSIPURI() throws {
+    @Test(arguments: ["sip", "sips"])
+    func preservesCompleteSIPURI(scheme: String) throws {
         let settings = SIPSettings(serverHost: "example.test")
+        let uri = "\(scheme):2001@example.net:5061;transport=tls;user=phone;x-test=value"
         #expect(
-            try settings.destinationURI(for: "sips:2001@example.net:5061")
-                == "sips:2001@example.net:5061"
+            try settings.destinationURI(for: uri) == uri
         )
     }
 
