@@ -59,7 +59,7 @@ private struct ContentView: View {
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logStore: AppLogStore
     @State private var selection: AppSection? = .phone
-    @State private var destination = ""
+    @AppStorage("call-destination-v1") private var destination = ""
     @State private var dtmfStatus = ""
     private let pollTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
