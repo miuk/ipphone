@@ -9,6 +9,7 @@ struct IPPhoneApp: App {
     @StateObject private var logStore: AppLogStore
     @StateObject private var settingsStore: SettingsStore
     @StateObject private var endpoint: SIPEndpoint
+    @StateObject private var destinationHistory = CallDestinationHistoryStore()
 
     init() {
         let logs = AppLogStore()
@@ -19,7 +20,7 @@ struct IPPhoneApp: App {
 
     var body: some Scene {
         WindowGroup("IP Phone Test Client") {
-            ContentView(endpoint: endpoint, settingsStore: settingsStore, logStore: logStore)
+            ContentView(endpoint: endpoint, settingsStore: settingsStore, logStore: logStore, destinationHistory: destinationHistory)
                 .frame(minWidth: 760, minHeight: 560)
         }
     }
@@ -58,6 +59,7 @@ private struct ContentView: View {
     @ObservedObject var endpoint: SIPEndpoint
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logStore: AppLogStore
+    @ObservedObject var destinationHistory: CallDestinationHistoryStore
     @State private var selection: AppSection? = .phone
     @AppStorage("call-destination-v1") private var destination = ""
     @State private var dtmfStatus = ""
@@ -78,6 +80,7 @@ private struct ContentView: View {
                     endpoint: endpoint,
                     settingsStore: settingsStore,
                     logs: logStore,
+                    destinationHistory: destinationHistory,
                     destination: $destination,
                     dtmfStatus: $dtmfStatus
                 )
@@ -206,6 +209,7 @@ private struct CallView: View {
     @ObservedObject var endpoint: SIPEndpoint
     @ObservedObject var settingsStore: SettingsStore
     @ObservedObject var logs: AppLogStore
+    @ObservedObject var destinationHistory: CallDestinationHistoryStore
     @Binding var destination: String
     @Binding var dtmfStatus: String
 
@@ -220,10 +224,26 @@ private struct CallView: View {
                         .foregroundStyle(.orange)
                 }
                 Divider()
-                TextField("Destination number or SIP URI", text: $destination)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(hasActiveCall)
-                    .onSubmit { makeCall() }
+                HStack {
+                    TextField("Destination number or SIP URI", text: $destination)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { makeCall() }
+                    Menu {
+                        ForEach(destinationHistory.destinations, id: \.self) { value in
+                            Button(value) { destination = value }
+                        }
+                        Divider()
+                        Button("Clear History", role: .destructive) {
+                            destinationHistory.clear()
+                        }
+                    } label: {
+                        Label("History", systemImage: "clock.arrow.circlepath")
+                    }
+                    .fixedSize()
+                    .disabled(destinationHistory.destinations.isEmpty)
+                    .help("Select a recent destination")
+                }
+                .disabled(hasActiveCall)
                 HStack {
                     Button("Call") { makeCall() }
                         .disabled(!canMakeCall)
@@ -339,7 +359,10 @@ private struct CallView: View {
     }
 
     private func makeCall() {
+        guard canMakeCall else { return }
         do {
+            _ = try settingsStore.settings.destinationURI(for: destination)
+            destinationHistory.record(destination)
             if !isRunning { try endpoint.start(settings: settingsStore.settings) }
             try endpoint.makeCall(
                 destination: destination,
