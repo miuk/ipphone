@@ -157,7 +157,8 @@ uint32_t ip_pjsip_endpoint_rtp_rx_jitter_usec(const IPPJSIPEndpoint *endpoint);
 
 /// Sends one DTMF digit for the active call. If telephone-event is requested
 /// but was not negotiated, the digit is sent in-band and `used_mode` reports
-/// the fallback.
+/// the fallback. Successful sends also play the digit on the call's audio
+/// output device as local feedback, independently of microphone muting.
 bool ip_pjsip_endpoint_send_dtmf(
     IPPJSIPEndpoint *endpoint,
     char digit,

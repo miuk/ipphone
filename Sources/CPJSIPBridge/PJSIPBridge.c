@@ -21,6 +21,7 @@ typedef struct DTMFInjectPort {
     pjmedia_port base;
     pjmedia_port *stream_port;
     pjmedia_port *tone_generator;
+    pjmedia_port *feedback_generator;
 } DTMFInjectPort;
 
 #define IP_PJSIP_LOG_CAPACITY 32
@@ -221,7 +222,34 @@ static pj_status_t dtmf_inject_put_frame(pjmedia_port *port, pjmedia_frame *fram
 
 static pj_status_t dtmf_inject_get_frame(pjmedia_port *port, pjmedia_frame *frame) {
     DTMFInjectPort *injector = (DTMFInjectPort *)port;
-    return pjmedia_port_get_frame(injector->stream_port, frame);
+    pj_status_t status = pjmedia_port_get_frame(injector->stream_port, frame);
+    if (status != PJ_SUCCESS || !pjmedia_tonegen_is_busy(injector->feedback_generator)) {
+        return status;
+    }
+
+    // Use a separate generator: capture and playback consume frames independently.
+    pj_int16_t samples[160];
+    pjmedia_frame feedback = {0};
+    feedback.buf = samples;
+    feedback.size = sizeof(samples);
+    status = pjmedia_port_get_frame(injector->feedback_generator, &feedback);
+    if (status != PJ_SUCCESS || feedback.type != PJMEDIA_FRAME_TYPE_AUDIO) {
+        return PJ_SUCCESS;
+    }
+    if (frame->type != PJMEDIA_FRAME_TYPE_AUDIO) {
+        pj_memcpy(frame->buf, feedback.buf, feedback.size);
+        frame->type = PJMEDIA_FRAME_TYPE_AUDIO;
+        frame->size = feedback.size;
+        return PJ_SUCCESS;
+    }
+
+    pj_int16_t *output = frame->buf;
+    pj_size_t count = PJ_MIN(frame->size, feedback.size) / sizeof(pj_int16_t);
+    for (pj_size_t i = 0; i < count; ++i) {
+        int mixed = (int)output[i] + samples[i];
+        output[i] = (pj_int16_t)PJ_MAX(-32768, PJ_MIN(32767, mixed));
+    }
+    return PJ_SUCCESS;
 }
 
 static pj_status_t create_dtmf_inject_port(
@@ -259,7 +287,9 @@ static pj_status_t create_dtmf_inject_port(
     injector->base.get_frame = &dtmf_inject_get_frame;
     endpoint->dtmf_inject_port = injector;
     endpoint->tone_generator = injector->tone_generator;
-    return PJ_SUCCESS;
+    return pjmedia_tonegen_create(
+        endpoint->call_pool, 8000, 1, 160, 16, 0, &injector->feedback_generator
+    );
 }
 
 static void destroy_media(IPPJSIPEndpoint *endpoint) {
@@ -271,6 +301,10 @@ static void destroy_media(IPPJSIPEndpoint *endpoint) {
     if (endpoint->tone_generator != NULL) {
         pjmedia_port_destroy(endpoint->tone_generator);
         endpoint->tone_generator = NULL;
+    }
+    if (endpoint->dtmf_inject_port != NULL
+        && endpoint->dtmf_inject_port->feedback_generator != NULL) {
+        pjmedia_port_destroy(endpoint->dtmf_inject_port->feedback_generator);
     }
     endpoint->dtmf_inject_port = NULL;
     if (endpoint->media_transport_started) {
@@ -1558,6 +1592,14 @@ bool ip_pjsip_endpoint_send_dtmf(
         copy_status_error(error_buffer, error_buffer_length, "Send DTMF", status);
         return false;
     }
+    pjmedia_tone_digit feedback = {
+        .digit = digit,
+        .on_msec = (short)duration_milliseconds,
+        .off_msec = 50,
+        .volume = 0
+    };
+    // Playback follows the sound port's selected output, including while muted.
+    pjmedia_tonegen_play_digits(endpoint->dtmf_inject_port->feedback_generator, 1, &feedback, 0);
     return true;
 }
 
