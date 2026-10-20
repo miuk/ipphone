@@ -631,8 +631,8 @@ struct SIPEndpointTests {
         #expect(result.usedFallback)
     }
 
-    @Test(arguments: ["opus", "PCMU", "opus PCMU", "PCMU opus"])
-    func offersOnlyEnabledCodecsInConfiguredOrder(order: String) throws {
+    @Test(arguments: ["opus", "PCMU", "opus PCMU", "PCMU opus"], DTMFMode.allCases)
+    func offersOnlyEnabledCodecsInConfiguredOrder(order: String, dtmfMode: DTMFMode) throws {
         let receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         try #require(receiver >= 0)
         defer { close(receiver) }
@@ -651,17 +651,21 @@ struct SIPEndpointTests {
         try endpoint.start(transport: .udp, serverHost: "127.0.0.1")
         defer { endpoint.stop() }
         let settings = SIPSettings(codecs: codecs, serverHost: "127.0.0.1",
-                                   serverPort: serverPort, userID: "1001", phoneNumber: "1001")
+                                   serverPort: serverPort, userID: "1001", phoneNumber: "1001",
+                                   dtmfMode: dtmfMode)
         try endpoint.makeCall(destination: "1002", settings: settings, password: "test")
         let invite = try receiveMessage(descriptor: receiver)
         let payloads = order.replacingOccurrences(of: "opus", with: "111")
             .replacingOccurrences(of: "PCMU", with: "0")
-        let eventPayloads = (codecs.offerOpus ? " 102" : "") + (codecs.offerPCMU ? " 101" : "")
+        let opusEvent = dtmfMode == .telephoneEvent && codecs.offerOpus
+        let pcmuEvent = dtmfMode == .telephoneEvent && codecs.offerPCMU
+        let eventPayloads = (opusEvent ? " 102" : "") + (pcmuEvent ? " 101" : "")
         #expect(invite.contains(" RTP/AVP \(payloads)\(eventPayloads)\r\n"))
-        #expect(invite.contains("a=rtpmap:102 telephone-event/48000\r\n") == codecs.offerOpus)
-        #expect(invite.contains("a=fmtp:102 0-16\r\n") == codecs.offerOpus)
-        #expect(invite.contains("a=rtpmap:101 telephone-event/8000\r\n") == codecs.offerPCMU)
-        #expect(invite.contains("a=fmtp:101 0-16\r\n") == codecs.offerPCMU)
+        #expect(invite.contains("a=rtpmap:102 telephone-event/48000\r\n") == opusEvent)
+        #expect(invite.contains("a=fmtp:102 0-16\r\n") == opusEvent)
+        #expect(invite.contains("a=rtpmap:101 telephone-event/8000\r\n") == pcmuEvent)
+        #expect(invite.contains("a=fmtp:101 0-16\r\n") == pcmuEvent)
+        #expect(invite.contains("telephone-event/") == (dtmfMode == .telephoneEvent))
         #expect(invite.contains("a=rtpmap:111 opus/48000/2") == codecs.offerOpus)
         #expect(invite.contains("a=rtpmap:0 PCMU/8000") == codecs.offerPCMU)
     }

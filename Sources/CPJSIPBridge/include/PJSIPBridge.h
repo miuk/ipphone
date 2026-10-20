@@ -123,6 +123,7 @@ bool ip_pjsip_endpoint_make_call(
     const char *destination_uri,
     const char *target_uri,
     bool uses_explicit_uri,
+    bool offer_telephone_event,
     const char *user_id,
     const char *password,
     uint16_t rtp_port,

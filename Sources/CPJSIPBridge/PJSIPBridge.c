@@ -669,6 +669,7 @@ static pjmedia_sdp_session *create_audio_sdp(
     IPPJSIPEndpoint *endpoint,
     uint16_t rtp_port,
     bool answering,
+    bool telephone_event,
     const pjmedia_sdp_session *offer
 ) {
     if (endpoint->call_pool == NULL) {
@@ -736,12 +737,12 @@ static pjmedia_sdp_session *create_audio_sdp(
         local->host.ptr,
         (unsigned)rtp_port,
         formats,
-        opus ? " 102" : "",
-        pcmu ? " 101" : "",
+        telephone_event && opus ? " 102" : "",
+        telephone_event && pcmu ? " 101" : "",
         opus ? "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 stereo=0;sprop-stereo=0\r\n" : "",
         pcmu ? "a=rtpmap:0 PCMU/8000\r\n" : "",
-        opus ? "a=rtpmap:102 telephone-event/48000\r\na=fmtp:102 0-16\r\n" : "",
-        pcmu ? "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\n" : ""
+        telephone_event && opus ? "a=rtpmap:102 telephone-event/48000\r\na=fmtp:102 0-16\r\n" : "",
+        telephone_event && pcmu ? "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\n" : ""
     );
     if (length <= 0 || length >= (int)sizeof(text)) {
         return NULL;
@@ -836,7 +837,7 @@ static void invite_rx_offer(
     if (endpoint == NULL || endpoint->invite_session != invite) {
         return;
     }
-    pjmedia_sdp_session *answer = create_audio_sdp(endpoint, endpoint->rtp_port, true, offer);
+    pjmedia_sdp_session *answer = create_audio_sdp(endpoint, endpoint->rtp_port, true, true, offer);
     if (answer != NULL) {
         pjsip_inv_set_sdp_answer(invite, answer);
     }
@@ -872,7 +873,7 @@ static pj_bool_t incoming_request(pjsip_rx_data *rdata) {
     }
 
     pjsip_rdata_sdp_info *sdp_info = pjsip_rdata_get_sdp_info(rdata);
-    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, endpoint->rtp_port, true, sdp_info->sdp);
+    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, endpoint->rtp_port, true, true, sdp_info->sdp);
     if (sdp == NULL) {
         pjsip_endpt_respond_stateless(endpoint->sip_endpoint, rdata, 488, NULL, NULL, NULL);
         destroy_media(endpoint);
@@ -1483,6 +1484,7 @@ bool ip_pjsip_endpoint_make_call(
     const char *destination_uri,
     const char *target_uri,
     bool uses_explicit_uri,
+    bool offer_telephone_event,
     const char *user_id,
     const char *password,
     uint16_t rtp_port,
@@ -1502,7 +1504,7 @@ bool ip_pjsip_endpoint_make_call(
         endpoint->call_pool = NULL;
     }
 
-    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, rtp_port, false, NULL);
+    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, rtp_port, false, offer_telephone_event, NULL);
     if (sdp == NULL) {
         copy_error(error_buffer, error_buffer_length, "Unable to create local SDP");
         return false;

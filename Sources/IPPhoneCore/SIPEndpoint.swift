@@ -319,6 +319,7 @@ public final class SIPEndpoint: ObservableObject {
                                 destinationURI,
                                 targetURI,
                                 usesExplicitURI,
+                                settings.dtmfMode == .telephoneEvent,
                                 userID,
                                 password,
                                 rtpPort,
