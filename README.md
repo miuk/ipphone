@@ -12,7 +12,7 @@ macOS 27向けのSIPテストクライアントです。仕様と計画は
 - PJSIP 2.17（Homebrewの`pjproject`）
 
 ```bash
-brew install pjproject
+brew install pjproject opus
 swift test
 swift run IPPhoneApp
 ```
@@ -45,10 +45,33 @@ Callsの着番号入力欄の横にある **History** から、発信操作で�
 5. Mediaが有効になると**Mute／Unmute**、RTP統計、DTMFダイヤルパッドを利用できます。DTMF方式は**Settings → Media → DTMF**で選択します。telephone-eventが相手側で利用できない場合はin-bandへ自動的にフォールバックし、送信結果を表示します。
 6. **Phone**の**Unregister**で登録解除、**Stop**でEndpointを停止します。
 
-通話中は**Calls**の「Media」が `PCMU/8000 send/receive` となり、
+通話中は**Calls**の「Media」に `opus/48000` または `PCMU/8000` の送受信状態を表示し、
 「RTP」にTX／RX／Lostのパケット数とJitter（μs）を表示します。
 無音中もTX件数が増えることを確認できます。Mediaに失敗が表示された場合は、
 その内容と通話相手のSDP、および**Logs**を確認してください。
+
+### コーデック設定
+
+**Settings → Outgoing offer codecs** で Opus／PCMU を個別に有効化し、
+両方を有効にした場合は **Preferred codec** で offer の優先順位を選択します。
+**Incoming offer codecs** では着信時に使用できるコーデックを個別に選択します。
+着信時は受信 offer の順番で、使用可能な最初のコーデックを選択します。
+共通コーデックがない着信には SIP 488 を返します。発信・着信それぞれ1つ以上を有効にしてください。
+初期値は両方有効・Opus優先です。既存の保存済みアカウント設定もそのまま読み込めます。
+変更は次の通話から反映され、Endpoint の再起動は不要です。
+
+telephone-event の RTP clock-rate は音声コーデックに合わせます。Opus の offer は
+`telephone-event/48000`、PCMU の offer は `telephone-event/8000` を含み、
+両方の音声コーデックを offer する場合は両方を含みます。answer には選択した音声
+コーデックと同じ clock-rate の telephone-event のみを含みます。受信 offer に同じ
+clock-rate がない場合は telephone-event を answer せず、in-band にフォールバックします。
+発信時に受信した answer が `opus/48000/2` と `telephone-event/8000` を選択した場合は、
+offer に含めた 8000 Hz の telephone-event を使用し、DTMF の duration と RTP timestamp も
+8000 Hz に合わせて送信します。
+
+Opus は48 kHz・monoで使用します（SDP の `opus/48000/2` は標準の表記）。
+Homebrew の PJSIP が Opus 無効でビルドされているため、PJSIP 2.17 の公式ラッパー
+`Sources/CPJSIPBridge/opus.c` を組み込み、Homebrew の libopus を静的リンクしています。
 
 ### ローカルIPの選択
 
@@ -85,7 +108,8 @@ scripts/package_app.sh
 - OSLogとアプリ内ログ表示
 - UDPによるREGISTER、Digest認証、登録解除、自動更新
 - UDPによる発着信、応答、拒否、CANCEL、BYE
-- PCMU（8 kHz、mono）によるRTP音声の送受信とCore Audio入出力
+- Opus（48 kHz、mono）／PCMU（8 kHz、mono）によるRTP音声の送受信とCore Audio入出力
+- 発信コーデックの選択・優先順位指定、着信コーデックの選択と相手の優先順位に従う交渉
 - 音声デバイス指定、マイクミュート、RTP送受信・損失・ジッター表示
 - telephone-eventおよびin-band DTMF送信
 - telephone-event非対応時のin-band自動フォールバックと通話中キーパッド

@@ -134,12 +134,14 @@ public final class SIPEndpoint: ObservableObject {
         allowSelfSignedCertificate: Bool = true,
         localIPAddress: String? = nil,
         serverHost: String? = nil,
-        serverPort: UInt16 = 5060
+        serverPort: UInt16 = 5060,
+        codecs: AudioCodecSettings = AudioCodecSettings()
     ) throws {
         guard handle == nil else {
             guard activeTransport == transport, activeLocalIPAddress == localIPAddress else {
                 throw SIPEndpointError.startupFailed("Stop and restart the endpoint after changing SIP transport or local IP address.")
             }
+            configureCodecs(codecs)
             return
         }
         if let localIPAddress {
@@ -193,6 +195,7 @@ public final class SIPEndpoint: ObservableObject {
         }
 
         handle = PJSIPHandle(newHandle)
+        configureCodecs(codecs)
         let boundPort = ip_pjsip_endpoint_bound_port(newHandle)
         state = .running(localPort: boundPort)
         activeTransport = transport
@@ -208,6 +211,12 @@ public final class SIPEndpoint: ObservableObject {
             category: "SIP",
             "\(transport.rawValue) endpoint started on local port \(boundPort), local IP \(selectedAddress ?? "automatic")\(certificatePolicy)"
         )
+    }
+
+    public func configureCodecs(_ codecs: AudioCodecSettings) {
+        guard let handle else { return }
+        ip_pjsip_endpoint_set_codecs(handle.rawValue, codecs.offerOpus, codecs.offerPCMU,
+                                    codecs.preferredOfferCodec == .opus, codecs.acceptOpus, codecs.acceptPCMU)
     }
 
     public func register(settings: SIPSettings, password: String) throws {
@@ -294,6 +303,7 @@ public final class SIPEndpoint: ObservableObject {
         else {
             throw SIPEndpointError.callFailed("SIP settings are invalid.")
         }
+        configureCodecs(settings.codecs)
         let destinationURI = try settings.destinationURI(for: destination)
         let trimmedDestination = destination.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let usesExplicitURI = trimmedDestination.hasPrefix("sip:") || trimmedDestination.hasPrefix("sips:")
@@ -462,7 +472,7 @@ public final class SIPEndpoint: ObservableObject {
         case IP_PJSIP_MEDIA_STARTING.rawValue:
             newState = .starting
         case IP_PJSIP_MEDIA_ACTIVE.rawValue:
-            newState = .active(codec: "PCMU/8000")
+            newState = .active(codec: String(cString: ip_pjsip_endpoint_media_codec(handle)))
         case IP_PJSIP_MEDIA_FAILED.rawValue:
             newState = .failed(message: message)
         default:

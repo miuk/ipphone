@@ -4,6 +4,35 @@ import Testing
 
 struct SIPSettingsTests {
     @Test
+    func migratesSettingsSavedBeforeCodecSupport() throws {
+        let settings = SIPSettings(serverHost: "sip.example.test", userID: "1001", phoneNumber: "1001")
+        let data = try JSONEncoder().encode(settings)
+        var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "audioCodecs")
+        let decoded = try JSONDecoder().decode(SIPSettings.self,
+            from: JSONSerialization.data(withJSONObject: object))
+        #expect(decoded.serverHost == settings.serverHost)
+        #expect(decoded.userID == settings.userID)
+        #expect(decoded.codecs == AudioCodecSettings())
+    }
+
+    @Test
+    func persistsCodecChoicesAndValidatesEmptySelection() throws {
+        var settings = SIPSettings()
+        settings.codecs.offerOpus = false
+        settings.codecs.preferredOfferCodec = .pcmu
+        settings.codecs.acceptPCMU = false
+        #expect(settings.codecs.offerCodecs == [.pcmu])
+        let restored = try JSONDecoder().decode(SIPSettings.self, from: JSONEncoder().encode(settings))
+        #expect(restored == settings)
+        settings.codecs.offerPCMU = false
+        #expect(settings.validationIssues().contains { $0.field == .audioCodec })
+        settings.codecs.offerOpus = true
+        settings.codecs.acceptOpus = false
+        #expect(settings.validationIssues().contains { $0.field == .audioCodec })
+    }
+
+    @Test
     func buildsNumberDestinationUsingConfiguredDomain() throws {
         let settings = SIPSettings(
             serverHost: "192.0.2.10",

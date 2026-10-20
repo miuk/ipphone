@@ -41,6 +41,8 @@ let package = Package(
             cSettings: [
                 .unsafeFlags([
                     "-I/opt/homebrew/opt/pjproject/include",
+                    "-I/opt/homebrew/opt/opus/include",
+                    "-DPJMEDIA_HAS_OPUS_CODEC=1",
                     "-DPJ_AUTOCONF=1",
                     "-DPJ_IS_BIG_ENDIAN=0",
                     "-DPJ_IS_LITTLE_ENDIAN=1",
@@ -51,6 +53,7 @@ let package = Package(
                     "-L/opt/homebrew/opt/pjproject/lib",
                     "-L/opt/homebrew/opt/openssl@4/lib",
                 ]),
+                .unsafeFlags(["/opt/homebrew/opt/opus/lib/libopus.a"]),
             ] + pjLibraries.map { .linkedLibrary($0) } + [
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("CoreServices"),

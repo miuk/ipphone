@@ -91,6 +91,9 @@ private struct ContentView: View {
             }
         }
         .onReceive(pollTimer) { _ in endpoint.poll() }
+        .onChange(of: settingsStore.settings.codecs) { _, codecs in
+            endpoint.configureCodecs(codecs)
+        }
     }
 }
 
@@ -408,7 +411,8 @@ private extension SIPEndpoint {
             allowSelfSignedCertificate: settings.allowSelfSignedCertificate,
             localIPAddress: settings.localIPAddress,
             serverHost: settings.serverHost,
-            serverPort: UInt16(exactly: settings.serverPort) ?? 5060
+            serverPort: UInt16(exactly: settings.serverPort) ?? 5060,
+            codecs: settings.codecs
         )
     }
 }
@@ -475,6 +479,24 @@ private struct SettingsView: View {
                     value: $store.settings.audioOutputDeviceIndex,
                     format: .number
                 )
+            }
+
+            Section("Outgoing offer codecs") {
+                Toggle("Offer Opus", isOn: $store.settings.codecs.offerOpus)
+                Toggle("Offer PCMU", isOn: $store.settings.codecs.offerPCMU)
+                Picker("Preferred codec", selection: $store.settings.codecs.preferredOfferCodec) {
+                    ForEach(AudioCodec.allCases) { codec in
+                        Text(codec.rawValue).tag(codec)
+                    }
+                }
+                .disabled(!store.settings.codecs.offerOpus || !store.settings.codecs.offerPCMU)
+            }
+
+            Section("Incoming offer codecs") {
+                Toggle("Accept Opus", isOn: $store.settings.codecs.acceptOpus)
+                Toggle("Accept PCMU", isOn: $store.settings.codecs.acceptPCMU)
+                Text("Selects the first enabled codec in the received offer's order.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("TLS") {

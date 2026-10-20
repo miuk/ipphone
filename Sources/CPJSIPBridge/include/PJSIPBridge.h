@@ -111,7 +111,12 @@ int ip_pjsip_endpoint_registration_status_code(const IPPJSIPEndpoint *endpoint);
 uint32_t ip_pjsip_endpoint_registration_expiration(const IPPJSIPEndpoint *endpoint);
 const char *ip_pjsip_endpoint_registration_message(const IPPJSIPEndpoint *endpoint);
 
-/// Sends an outgoing INVITE with PCMU and telephone-event media capabilities.
+/// Sets independent offer and answer capabilities. Apply before starting calls.
+void ip_pjsip_endpoint_set_codecs(IPPJSIPEndpoint *endpoint, bool offer_opus,
+    bool offer_pcmu, bool prefer_opus, bool accept_opus, bool accept_pcmu);
+const char *ip_pjsip_endpoint_media_codec(const IPPJSIPEndpoint *endpoint);
+
+/// Sends an outgoing INVITE with configured audio and telephone-event capabilities.
 bool ip_pjsip_endpoint_make_call(
     IPPJSIPEndpoint *endpoint,
     const char *local_uri,

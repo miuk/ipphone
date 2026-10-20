@@ -27,6 +27,7 @@ install -m 644 "$OPENSSL_PREFIX/lib/libssl.4.dylib" "$FRAMEWORKS_DIRECTORY/libss
 install -m 644 "$OPENSSL_PREFIX/lib/libcrypto.4.dylib" "$FRAMEWORKS_DIRECTORY/libcrypto.4.dylib"
 install -m 644 "/opt/homebrew/opt/pjproject/COPYING" "$RESOURCES_DIRECTORY/Licenses/PJSIP-COPYING.txt"
 install -m 644 "/opt/homebrew/opt/openssl@4/LICENSE.txt" "$RESOURCES_DIRECTORY/Licenses/OpenSSL-LICENSE.txt"
+install -m 644 "/opt/homebrew/opt/opus/COPYING" "$RESOURCES_DIRECTORY/Licenses/Opus-COPYING.txt"
 
 codesign --remove-signature "$FRAMEWORKS_DIRECTORY/libssl.4.dylib"
 codesign --remove-signature "$FRAMEWORKS_DIRECTORY/libcrypto.4.dylib"

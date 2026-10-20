@@ -2,9 +2,11 @@
 
 #include <pjlib-util.h>
 #include <pj/rand.h>
+#include <pj/array.h>
 #include <pjnath.h>
 #include <pjmedia.h>
 #include <pjmedia/g711.h>
+#include <pjmedia-codec/opus.h>
 #include <pjmedia/sound_port.h>
 #include <pjmedia/tonegen.h>
 #include <pjmedia/transport_udp.h>
@@ -47,6 +49,17 @@ struct IPPJSIPEndpoint {
     pjmedia_event_mgr *media_event_manager;
     pjmedia_transport *media_transport;
     bool media_transport_started;
+    pjmedia_transport_op media_transport_ops;
+    pj_status_t (*original_send_rtp)(pjmedia_transport *, const void *, pj_size_t);
+    int tx_event_payload;
+    unsigned audio_rtp_clock;
+    unsigned tx_event_clock;
+    bool event_timestamp_initialized;
+    uint32_t event_source_timestamp;
+    uint32_t event_wire_timestamp;
+    unsigned event_timestamp_remainder;
+    uint16_t event_last_duration;
+    uint32_t event_extended_duration;
     pjmedia_stream *media_stream;
     pjmedia_snd_port *sound_port;
     DTMFInjectPort *dtmf_inject_port;
@@ -66,6 +79,9 @@ struct IPPJSIPEndpoint {
     bool local_termination;
     bool audio_initialized;
     bool g711_initialized;
+    bool opus_initialized;
+    bool offer_opus, offer_pcmu, prefer_opus, accept_opus, accept_pcmu;
+    char media_codec[64];
     bool muted;
     bool telephone_event_available;
     IPPJSIPMediaState media_state;
@@ -228,7 +244,7 @@ static pj_status_t dtmf_inject_get_frame(pjmedia_port *port, pjmedia_frame *fram
     }
 
     // Use a separate generator: capture and playback consume frames independently.
-    pj_int16_t samples[160];
+    pj_int16_t samples[PJMEDIA_PIA_SPF(&port->info)];
     pjmedia_frame feedback = {0};
     feedback.buf = samples;
     feedback.size = sizeof(samples);
@@ -258,23 +274,26 @@ static pj_status_t create_dtmf_inject_port(
 ) {
     DTMFInjectPort *injector = PJ_POOL_ZALLOC_T(endpoint->call_pool, DTMFInjectPort);
     pj_str_t name = pj_str("dtmf-inject");
+    unsigned rate = PJMEDIA_PIA_SRATE(&stream_port->info);
+    unsigned channels = PJMEDIA_PIA_CCNT(&stream_port->info);
+    unsigned samples = PJMEDIA_PIA_SPF(&stream_port->info);
     pj_status_t status = pjmedia_port_info_init(
         &injector->base.info,
         &name,
         PJMEDIA_SIG_CLASS_PORT('D', 'T', 'F'),
-        8000,
-        1,
+        rate,
+        channels,
         16,
-        160
+        samples
     );
     if (status != PJ_SUCCESS) {
         return status;
     }
     status = pjmedia_tonegen_create(
         endpoint->call_pool,
-        8000,
-        1,
-        160,
+        rate,
+        channels,
+        samples,
         16,
         0,
         &injector->tone_generator
@@ -288,7 +307,7 @@ static pj_status_t create_dtmf_inject_port(
     endpoint->dtmf_inject_port = injector;
     endpoint->tone_generator = injector->tone_generator;
     return pjmedia_tonegen_create(
-        endpoint->call_pool, 8000, 1, 160, 16, 0, &injector->feedback_generator
+        endpoint->call_pool, rate, channels, samples, 16, 0, &injector->feedback_generator
     );
 }
 
@@ -377,6 +396,63 @@ static bool default_audio_device(pj_bool_t capture, int *index, char *name, size
     return false;
 }
 
+// PJMEDIA 2.17 generates telephone-event timing using the audio RTP clock.
+// Convert only event packets when a received answer selects a different clock.
+static pj_status_t send_rtp_with_event_clock(pjmedia_transport *transport,
+                                            const void *packet, pj_size_t size) {
+    IPPJSIPEndpoint *endpoint = transport->user_data;
+    const uint8_t *bytes = packet;
+    if (endpoint->tx_event_clock == 0 || endpoint->tx_event_clock == endpoint->audio_rtp_clock
+        || size != 16 || bytes[0] != 0x80 || (bytes[1] & 0x7f) != endpoint->tx_event_payload) {
+        return endpoint->original_send_rtp(transport, packet, size);
+    }
+    uint8_t converted[16];
+    memcpy(converted, bytes, sizeof(converted));
+    uint32_t timestamp = ((uint32_t)bytes[4] << 24) | ((uint32_t)bytes[5] << 16)
+        | ((uint32_t)bytes[6] << 8) | bytes[7];
+    bool new_event = !endpoint->event_timestamp_initialized || timestamp != endpoint->event_source_timestamp;
+    if (!endpoint->event_timestamp_initialized) {
+        uint64_t scaled = (uint64_t)timestamp * endpoint->tx_event_clock;
+        endpoint->event_wire_timestamp = (uint32_t)(scaled / endpoint->audio_rtp_clock);
+        endpoint->event_timestamp_remainder = (unsigned)(scaled % endpoint->audio_rtp_clock);
+        endpoint->event_timestamp_initialized = true;
+    } else if (new_event) {
+        // Unsigned deltas preserve continuity when the source timestamp wraps.
+        uint32_t delta = timestamp - endpoint->event_source_timestamp;
+        uint64_t scaled = (uint64_t)delta * endpoint->tx_event_clock + endpoint->event_timestamp_remainder;
+        endpoint->event_wire_timestamp += (uint32_t)(scaled / endpoint->audio_rtp_clock);
+        endpoint->event_timestamp_remainder = (unsigned)(scaled % endpoint->audio_rtp_clock);
+    }
+    endpoint->event_source_timestamp = timestamp;
+    if (new_event) {
+        endpoint->event_last_duration = 0;
+        endpoint->event_extended_duration = 0;
+    }
+    uint16_t duration = ((uint16_t)bytes[14] << 8) | bytes[15];
+    endpoint->event_extended_duration += (uint16_t)(duration - endpoint->event_last_duration);
+    endpoint->event_last_duration = duration;
+    uint16_t wire_duration = (uint16_t)((uint64_t)endpoint->event_extended_duration
+        * endpoint->tx_event_clock / endpoint->audio_rtp_clock);
+    for (unsigned i = 0; i < 4; ++i) {
+        converted[4 + i] = (uint8_t)(endpoint->event_wire_timestamp >> (24 - 8 * i));
+    }
+    converted[14] = (uint8_t)(wire_duration >> 8);
+    converted[15] = (uint8_t)wire_duration;
+    return endpoint->original_send_rtp(transport, converted, sizeof(converted));
+}
+
+static int matching_event_payload(const pjmedia_sdp_media *media, unsigned clock_rate) {
+    for (unsigned i = 0; i < media->desc.fmt_count; ++i) {
+        const pjmedia_sdp_attr *attr = pjmedia_sdp_media_find_attr2(media, "rtpmap", &media->desc.fmt[i]);
+        pjmedia_sdp_rtpmap map;
+        if (attr != NULL && pjmedia_sdp_attr_get_rtpmap(attr, &map) == PJ_SUCCESS
+            && pj_stricmp2(&map.enc_name, "telephone-event") == 0 && map.clock_rate == clock_rate) {
+            return (int)pj_strtoul(&media->desc.fmt[i]);
+        }
+    }
+    return -1;
+}
+
 static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
     if (endpoint->media_stream != NULL || invite->neg == NULL) {
         return;
@@ -407,8 +483,9 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
         set_media_error(endpoint, "pjmedia_stream_info_from_sdp", status);
         return;
     }
-    if (info.fmt.pt != 0) {
-        snprintf(endpoint->media_message, sizeof(endpoint->media_message), "Remote endpoint did not negotiate PCMU");
+    if (pj_stricmp2(&info.fmt.encoding_name, "PCMU") != 0
+        && pj_stricmp2(&info.fmt.encoding_name, "opus") != 0) {
+        snprintf(endpoint->media_message, sizeof(endpoint->media_message), "Remote endpoint did not negotiate a supported audio codec");
         endpoint->media_state = IP_PJSIP_MEDIA_FAILED;
         return;
     }
@@ -420,13 +497,33 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
             info.param
         );
         if (status != PJ_SUCCESS) {
-            set_media_error(endpoint, "PCMU codec parameters", status);
+            set_media_error(endpoint, "Audio codec parameters", status);
             return;
         }
     }
     // Keep sending RTP during silence so the peer receives a continuous stream.
     info.param->setting.vad = 0;
+    // Opus always uses a 48 kHz RTP clock, even when PCM sampling is lower.
+    unsigned audio_clock = pj_stricmp2(&info.fmt.encoding_name, "opus") == 0 ? 48000 : 8000;
+    unsigned event_clock = audio_clock;
+    // Accept an 8 kHz event selected by the remote answer alongside Opus,
+    // provided that this event was included in our negotiated local offer.
+    if (audio_clock == 48000 && pjmedia_sdp_neg_was_answer_remote(invite->neg)
+        && matching_event_payload(remote_sdp->media[0], 48000) < 0
+        && matching_event_payload(remote_sdp->media[0], 8000) >= 0
+        && matching_event_payload(local_sdp->media[0], 8000) >= 0) {
+        event_clock = 8000;
+    }
+    info.rx_event_pt = matching_event_payload(local_sdp->media[0], event_clock);
+    info.tx_event_pt = matching_event_payload(remote_sdp->media[0], event_clock);
+    if (info.rx_event_pt < 0 || info.tx_event_pt < 0) {
+        info.rx_event_pt = info.tx_event_pt = -1;
+    }
     endpoint->telephone_event_available = info.tx_event_pt >= 0;
+    endpoint->tx_event_payload = info.tx_event_pt;
+    endpoint->audio_rtp_clock = audio_clock;
+    endpoint->tx_event_clock = endpoint->telephone_event_available ? event_clock : 0;
+    endpoint->event_timestamp_initialized = false;
 
     status = pjmedia_stream_create(
         endpoint->media_endpoint,
@@ -504,9 +601,9 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
             endpoint->call_pool,
             input_device,
             output_device,
-            8000,
-            1,
-            160,
+            PJMEDIA_PIA_SRATE(&stream_port->info),
+            PJMEDIA_PIA_CCNT(&stream_port->info),
+            PJMEDIA_PIA_SPF(&stream_port->info),
             16,
             0,
             &endpoint->sound_port
@@ -520,16 +617,59 @@ static void start_media(IPPJSIPEndpoint *endpoint, pjsip_inv_session *invite) {
         return;
     }
 
+    snprintf(endpoint->media_codec, sizeof(endpoint->media_codec), "%.*s/%u",
+             (int)info.fmt.encoding_name.slen, info.fmt.encoding_name.ptr, info.fmt.clock_rate);
     endpoint->media_state = IP_PJSIP_MEDIA_ACTIVE;
     snprintf(endpoint->media_message, sizeof(endpoint->media_message),
-             "PCMU 8000 Hz send/receive active (input: %s, output: %s)",
+             "%s send/receive active (input: %s, output: %s)",
+             endpoint->media_codec,
              input_name[0] ? input_name : "unknown",
              output_name[0] ? output_name : "unknown");
 }
 
+// Keep only events matching the audio codec that the remote-order negotiator
+// will select. PJSIP otherwise falls back to an event with a different clock.
+static void limit_answer_event_clock(pj_pool_t *pool, pjmedia_sdp_session *answer,
+                                    const pjmedia_sdp_session *offer) {
+    if (offer == NULL || offer->media_count == 0 || answer->media_count == 0) { return; }
+    pjmedia_sdp_media *local = answer->media[0];
+    pjmedia_sdp_media *remote = offer->media[0];
+    unsigned clock_rate = 0;
+    for (unsigned i = 0; i < remote->desc.fmt_count && clock_rate == 0; ++i) {
+        for (unsigned j = 0; j < local->desc.fmt_count; ++j) {
+            pjmedia_sdp_attr *attr = pjmedia_sdp_media_find_attr2(local, "rtpmap", &local->desc.fmt[j]);
+            pjmedia_sdp_rtpmap map;
+            if (attr == NULL || pjmedia_sdp_attr_get_rtpmap(attr, &map) != PJ_SUCCESS
+                || pj_stricmp2(&map.enc_name, "telephone-event") == 0) { continue; }
+            if (pjmedia_sdp_neg_fmt_match(pool, remote, i, local, j, 0) == PJ_SUCCESS) {
+                clock_rate = map.clock_rate;
+                break;
+            }
+        }
+    }
+    if (clock_rate == 0) { return; } // The normal negotiator rejects incompatible audio.
+    for (unsigned i = 0; i < local->desc.fmt_count; ) {
+        pj_str_t payload = local->desc.fmt[i];
+        pjmedia_sdp_attr *attr = pjmedia_sdp_media_find_attr2(local, "rtpmap", &payload);
+        pjmedia_sdp_rtpmap map;
+        if (attr != NULL && pjmedia_sdp_attr_get_rtpmap(attr, &map) == PJ_SUCCESS
+            && pj_stricmp2(&map.enc_name, "telephone-event") == 0 && map.clock_rate != clock_rate) {
+            pjmedia_sdp_media_remove_attr(local, attr);
+            attr = pjmedia_sdp_media_find_attr2(local, "fmtp", &payload);
+            if (attr != NULL) { pjmedia_sdp_media_remove_attr(local, attr); }
+            pj_array_erase(local->desc.fmt, sizeof(local->desc.fmt[0]), local->desc.fmt_count, i);
+            local->desc.fmt_count--;
+        } else {
+            ++i;
+        }
+    }
+}
+
 static pjmedia_sdp_session *create_audio_sdp(
     IPPJSIPEndpoint *endpoint,
-    uint16_t rtp_port
+    uint16_t rtp_port,
+    bool answering,
+    const pjmedia_sdp_session *offer
 ) {
     if (endpoint->call_pool == NULL) {
         endpoint->call_pool = pj_pool_create(
@@ -562,8 +702,18 @@ static pjmedia_sdp_session *create_audio_sdp(
             ) != PJ_SUCCESS) {
             return NULL;
         }
+        endpoint->media_transport_ops = *endpoint->media_transport->op;
+        endpoint->original_send_rtp = endpoint->media_transport_ops.send_rtp;
+        endpoint->media_transport_ops.send_rtp = &send_rtp_with_event_clock;
+        endpoint->media_transport->user_data = endpoint;
+        endpoint->media_transport->op = &endpoint->media_transport_ops;
         endpoint->rtp_port = rtp_port;
     }
+    bool opus = answering ? endpoint->accept_opus : endpoint->offer_opus;
+    bool pcmu = answering ? endpoint->accept_pcmu : endpoint->offer_pcmu;
+    if (!opus && !pcmu) { return NULL; }
+    const char *formats = opus && pcmu
+        ? (endpoint->prefer_opus ? "111 0" : "0 111") : (opus ? "111" : "0");
     char text[1024];
     int length = snprintf(
         text,
@@ -573,10 +723,8 @@ static pjmedia_sdp_session *create_audio_sdp(
         "s=IPPhone\r\n"
         "c=IN %s %.*s\r\n"
         "t=0 0\r\n"
-        "m=audio %u RTP/AVP 0 101\r\n"
-        "a=rtpmap:0 PCMU/8000\r\n"
-        "a=rtpmap:101 telephone-event/8000\r\n"
-        "a=fmtp:101 0-16\r\n"
+        "m=audio %u RTP/AVP %s%s%s\r\n"
+        "%s%s%s%s"
         "a=sendrecv\r\n",
         (unsigned)pj_rand(),
         (unsigned)pj_rand(),
@@ -586,7 +734,14 @@ static pjmedia_sdp_session *create_audio_sdp(
         ipv6 ? "IP6" : "IP4",
         (int)local->host.slen,
         local->host.ptr,
-        (unsigned)rtp_port
+        (unsigned)rtp_port,
+        formats,
+        opus ? " 102" : "",
+        pcmu ? " 101" : "",
+        opus ? "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 stereo=0;sprop-stereo=0\r\n" : "",
+        pcmu ? "a=rtpmap:0 PCMU/8000\r\n" : "",
+        opus ? "a=rtpmap:102 telephone-event/48000\r\na=fmtp:102 0-16\r\n" : "",
+        pcmu ? "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\n" : ""
     );
     if (length <= 0 || length >= (int)sizeof(text)) {
         return NULL;
@@ -598,6 +753,7 @@ static pjmedia_sdp_session *create_audio_sdp(
     if (pjmedia_sdp_parse(endpoint->call_pool, sdp_text, (pj_size_t)length, &sdp) != PJ_SUCCESS) {
         return NULL;
     }
+    if (answering) { limit_answer_event_clock(endpoint->call_pool, sdp, offer); }
     return sdp;
 }
 
@@ -675,12 +831,12 @@ static void invite_rx_offer(
     pjsip_inv_session *invite,
     const pjmedia_sdp_session *offer
 ) {
-    PJ_UNUSED_ARG(offer);
+    pjmedia_sdp_neg_set_prefer_remote_codec_order(invite->neg, PJ_TRUE);
     IPPJSIPEndpoint *endpoint = active_endpoint;
     if (endpoint == NULL || endpoint->invite_session != invite) {
         return;
     }
-    pjmedia_sdp_session *answer = create_audio_sdp(endpoint, endpoint->rtp_port);
+    pjmedia_sdp_session *answer = create_audio_sdp(endpoint, endpoint->rtp_port, true, offer);
     if (answer != NULL) {
         pjsip_inv_set_sdp_answer(invite, answer);
     }
@@ -715,6 +871,24 @@ static pj_bool_t incoming_request(pjsip_rx_data *rdata) {
         return PJ_TRUE;
     }
 
+    pjsip_rdata_sdp_info *sdp_info = pjsip_rdata_get_sdp_info(rdata);
+    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, endpoint->rtp_port, true, sdp_info->sdp);
+    if (sdp == NULL) {
+        pjsip_endpt_respond_stateless(endpoint->sip_endpoint, rdata, 488, NULL, NULL, NULL);
+        destroy_media(endpoint);
+        return PJ_TRUE;
+    }
+    unsigned options = 0;
+    pjsip_tx_data *rejection = NULL;
+    if (pjsip_inv_verify_request(rdata, &options, sdp, NULL,
+                                 endpoint->sip_endpoint, &rejection) != PJ_SUCCESS) {
+        if (rejection != NULL) {
+            pjsip_endpt_send_response2(endpoint->sip_endpoint, rdata, rejection, NULL, NULL);
+        }
+        destroy_media(endpoint);
+        return PJ_TRUE;
+    }
+
     char contact_buffer[PJSIP_MAX_URL_SIZE];
     pj_str_t contact;
     pj_str_t *local_contact = NULL;
@@ -744,14 +918,15 @@ static pj_bool_t incoming_request(pjsip_rx_data *rdata) {
         pjsip_dlg_set_transport(dialog, &selector);
     }
 
-    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, endpoint->rtp_port);
-    status = pjsip_inv_create_uas(dialog, rdata, sdp, 0, &endpoint->invite_session);
+    status = pjsip_inv_create_uas(dialog, rdata, sdp, options, &endpoint->invite_session);
     if (status != PJ_SUCCESS) {
         pjsip_dlg_dec_lock(dialog);
         pjsip_endpt_respond_stateless(endpoint->sip_endpoint, rdata, 500, NULL, NULL, NULL);
         return PJ_TRUE;
     }
 
+    pjmedia_sdp_neg_set_prefer_remote_codec_order(endpoint->invite_session->neg, PJ_TRUE);
+    pjmedia_sdp_neg_set_answer_multiple_codecs(endpoint->invite_session->neg, PJ_FALSE);
     set_remote_uri(endpoint, rdata->msg_info.from);
     endpoint->call_state = IP_PJSIP_CALL_INCOMING;
     endpoint->local_termination = false;
@@ -846,7 +1021,9 @@ static void copy_status_error(
 }
 
 IPPJSIPEndpoint *ip_pjsip_endpoint_create(void) {
-    return calloc(1, sizeof(IPPJSIPEndpoint));
+    IPPJSIPEndpoint *endpoint = calloc(1, sizeof(IPPJSIPEndpoint));
+    ip_pjsip_endpoint_set_codecs(endpoint, true, true, true, true, true);
+    return endpoint;
 }
 
 bool ip_pjsip_endpoint_start(
@@ -917,6 +1094,13 @@ bool ip_pjsip_endpoint_start(
         return false;
     }
     endpoint->g711_initialized = true;
+    status = pjmedia_codec_opus_init(endpoint->media_endpoint);
+    if (status != PJ_SUCCESS) {
+        copy_status_error(error_buffer, error_buffer_length, "pjmedia_codec_opus_init", status);
+        ip_pjsip_endpoint_stop(endpoint);
+        return false;
+    }
+    endpoint->opus_initialized = true;
     endpoint->media_pool = pjmedia_endpt_create_pool(
         endpoint->media_endpoint,
         "ipphone-media",
@@ -1279,6 +1463,20 @@ const char *ip_pjsip_endpoint_registration_message(const IPPJSIPEndpoint *endpoi
     return endpoint == NULL ? "" : endpoint->registration_message;
 }
 
+void ip_pjsip_endpoint_set_codecs(IPPJSIPEndpoint *endpoint, bool offer_opus,
+    bool offer_pcmu, bool prefer_opus, bool accept_opus, bool accept_pcmu) {
+    if (endpoint == NULL) { return; }
+    endpoint->offer_opus = offer_opus;
+    endpoint->offer_pcmu = offer_pcmu;
+    endpoint->prefer_opus = prefer_opus;
+    endpoint->accept_opus = accept_opus;
+    endpoint->accept_pcmu = accept_pcmu;
+}
+
+const char *ip_pjsip_endpoint_media_codec(const IPPJSIPEndpoint *endpoint) {
+    return endpoint == NULL ? "" : endpoint->media_codec;
+}
+
 bool ip_pjsip_endpoint_make_call(
     IPPJSIPEndpoint *endpoint,
     const char *local_uri,
@@ -1304,7 +1502,7 @@ bool ip_pjsip_endpoint_make_call(
         endpoint->call_pool = NULL;
     }
 
-    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, rtp_port);
+    pjmedia_sdp_session *sdp = create_audio_sdp(endpoint, rtp_port, false, NULL);
     if (sdp == NULL) {
         copy_error(error_buffer, error_buffer_length, "Unable to create local SDP");
         return false;
@@ -1638,6 +1836,10 @@ void ip_pjsip_endpoint_stop(IPPJSIPEndpoint *endpoint) {
         active_endpoint = NULL;
     }
     destroy_media(endpoint);
+    if (endpoint->opus_initialized) {
+        pjmedia_codec_opus_deinit();
+        endpoint->opus_initialized = false;
+    }
     if (endpoint->g711_initialized) {
         pjmedia_codec_g711_deinit();
         endpoint->g711_initialized = false;

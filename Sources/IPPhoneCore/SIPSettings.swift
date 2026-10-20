@@ -23,7 +23,34 @@ public enum TLSURIScheme: String, Codable, CaseIterable, Identifiable, Sendable 
     public var id: Self { self }
 }
 
+public enum AudioCodec: String, Codable, CaseIterable, Identifiable, Sendable {
+    case opus = "opus"
+    case pcmu = "PCMU"
+    public var id: Self { self }
+}
+
+public struct AudioCodecSettings: Codable, Equatable, Sendable {
+    public var offerOpus = true
+    public var offerPCMU = true
+    public var preferredOfferCodec: AudioCodec = .opus
+    public var acceptOpus = true
+    public var acceptPCMU = true
+
+    public init() {}
+
+    public var offerCodecs: [AudioCodec] {
+        let order: [AudioCodec] = preferredOfferCodec == .opus ? [.opus, .pcmu] : [.pcmu, .opus]
+        return order.filter { $0 == .opus ? offerOpus : offerPCMU }
+    }
+}
+
 public struct SIPSettings: Codable, Equatable, Sendable {
+    // Optional storage keeps settings saved before codec support readable.
+    private var audioCodecs: AudioCodecSettings?
+    public var codecs: AudioCodecSettings {
+        get { audioCodecs ?? AudioCodecSettings() }
+        set { audioCodecs = newValue }
+    }
     public var serverHost: String
     public var serverPort: Int
     public var transport: SIPTransport
@@ -44,6 +71,7 @@ public struct SIPSettings: Codable, Equatable, Sendable {
     public var audioOutputDeviceIndex: Int?
 
     public init(
+        codecs: AudioCodecSettings = AudioCodecSettings(),
         serverHost: String = "",
         serverPort: Int = 5060,
         transport: SIPTransport = .udp,
@@ -63,6 +91,7 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         audioInputDeviceIndex: Int? = nil,
         audioOutputDeviceIndex: Int? = nil
     ) {
+        self.audioCodecs = codecs
         self.serverHost = serverHost
         self.serverPort = serverPort
         self.transport = transport
@@ -166,6 +195,12 @@ public struct SIPSettings: Codable, Equatable, Sendable {
         if let index = audioOutputDeviceIndex, index < 0 {
             issues.append(.init(field: .audioDevice, message: "音声出力デバイスのインデックスが正しくありません。"))
         }
+        if codecs.offerCodecs.isEmpty {
+            issues.append(.init(field: .audioCodec, message: "発信コーデックを1つ以上選択してください。"))
+        }
+        if !codecs.acceptOpus && !codecs.acceptPCMU {
+            issues.append(.init(field: .audioCodec, message: "着信コーデックを1つ以上選択してください。"))
+        }
         return issues
     }
 
@@ -211,6 +246,7 @@ public enum SIPSettingsField: String, Sendable {
     case sipDomain
     case registrationExpiration
     case rtpPortRange
+    case audioCodec
     case audioDevice
 }
 

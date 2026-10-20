@@ -2,13 +2,17 @@
 
 This application incorporates PJSIP 2.17, installed by the Homebrew
 `pjproject` formula under GPL-2.0-or-later, and dynamically links OpenSSL 4,
-licensed under Apache-2.0.
+licensed under Apache-2.0. It also statically links libopus (BSD-3-Clause).
+The bundled `Sources/CPJSIPBridge/opus.c` is the unmodified PJSIP 2.17 Opus
+wrapper (GPL-2.0-or-later), from:
+https://github.com/pjsip/pjproject/blob/2.17/pjmedia/src/pjmedia-codec/opus.c
 
 The application bundle contains the license texts copied from the installed
 Homebrew formulae:
 
 - `Licenses/PJSIP-COPYING.txt`
 - `Licenses/OpenSSL-LICENSE.txt`
+- `Licenses/Opus-COPYING.txt`
 
 Project source and build instructions are maintained in this repository.
 Do not redistribute the application bundle by itself. Distribution under the
@@ -23,3 +27,4 @@ Upstream projects:
 
 - PJSIP: https://www.pjsip.org/
 - OpenSSL: https://openssl-library.org/
+- Opus: https://opus-codec.org/
